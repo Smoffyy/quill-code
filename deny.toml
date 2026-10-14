@@ -1,0 +1,44 @@
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+all-features = false
+
+[licenses]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+    "Unlicense",
+    "BSL-1.0",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs" },
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    { crate = "sentry" },
+    { crate = "sentry-core" },
+    { crate = "opentelemetry" },
+    { crate = "opentelemetry-otlp" },
+    { crate = "posthog-rs" },
+    { crate = "segment" },
+    { crate = "mixpanel" },
+    { crate = "amplitude" },
+    { crate = "datadog-apm" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

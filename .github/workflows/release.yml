@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml, CHANGELOG.md]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.version.outputs.release }}
+      title: ${{ steps.changelog.outputs.title }}
+      notes: ${{ steps.changelog.outputs.notes }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "quill-code") | .version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release list --limit 1000 --json tagName --jq '.[].tagName' | grep -Fqx "v$version"; then
+            echo "v$version already has a release"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+      - id: changelog
+        if: steps.version.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          title=$(awk -v v="$VERSION" '$1 == "##" && $2 == v { print substr($0, 4); exit }' CHANGELOG.md)
+          if [ -z "$title" ]; then
+            echo "::error file=CHANGELOG.md::No '## $VERSION' section in CHANGELOG.md"
+            exit 1
+          fi
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+          {
+            echo "notes<<EOF_NOTES"
+            awk -v v="$VERSION" '$1 == "##" { if (found) exit; found = $2 == v; next } found' CHANGELOG.md
+            echo "EOF_NOTES"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libfontconfig-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
+      - run: cargo build -p quill-code --release --locked --target ${{ matrix.target }}
+      - shell: bash
+        env:
+          NAME: quill-code-${{ needs.prepare.outputs.version }}-${{ matrix.target }}
+        run: |
+          mkdir "$NAME"
+          cp LICENSE README.md assets/fonts/OFL.txt "$NAME"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/${{ matrix.target }}/release/quill-code.exe "$NAME"
+            7z a -tzip "$NAME.zip" "$NAME"
+          else
+            cp target/${{ matrix.target }}/release/quill-code "$NAME"
+            tar czf "$NAME.tar.gz" "$NAME"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: quill-code-*.*
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.prepare.outputs.version }}
+          TITLE: ${{ needs.prepare.outputs.title }}
+          NOTES: ${{ needs.prepare.outputs.notes }}
+        run: |
+          printf '%s\n' "$NOTES" > notes.md
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" --title "$TITLE" --notes-file notes.md

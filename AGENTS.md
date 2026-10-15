@@ -15,6 +15,8 @@ A native desktop control surface for coding agents on local models. The assistan
 
 CI (`.github/workflows/ci.yml`, Windows) runs build, clippy, test and `cargo deny check`. All must stay green.
 
+Releases (`.github/workflows/release.yml`) run when `main` gets a workspace version that has no release yet. The version needs a `## <version>` section in `CHANGELOG.md`, whose heading becomes the release title and whose body the notes. Windows, Linux and both macOS targets are built and attached to a draft release tagged `v<version>`, which is published by hand.
+
 ## Rules that do not bend
 
 - **No telemetry.** No analytics, crash reporting or update pings. The app talks only to the model server the user configured, to git remotes through the user's own `git`, and to the GitHub API for what the user asked for: creating a repository, opening a pull request, and reading pull request status for branches whose origin is on GitHub. `deny.toml` bans the usual telemetry crates; do not add network calls anywhere else.

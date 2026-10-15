@@ -1,5 +1,6 @@
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{App, Global, Hsla, Window, WindowAppearance, px, rgb, rgba, transparent_black};
+use quill_config::Theme as ThemeChoice;
 
 pub const FONT: &str = "Open Sans";
 
@@ -8,6 +9,7 @@ pub struct Palette {
     pub dark: bool,
     pub bg: Hsla,
     pub sidebar: Hsla,
+    pub raised: Hsla,
     pub surface_2: Hsla,
     pub surface_hover: Hsla,
     pub border: Hsla,
@@ -16,6 +18,8 @@ pub struct Palette {
     pub text_muted: Hsla,
     pub text_faint: Hsla,
     pub accent: Hsla,
+    pub accent_soft: Hsla,
+    pub accent_text: Hsla,
     pub sidebar_text: Hsla,
     pub row_hover: Hsla,
     pub row_active: Hsla,
@@ -49,66 +53,72 @@ impl Palette {
     pub fn dark() -> Self {
         Palette {
             dark: true,
-            bg: hex(0x151515),
-            sidebar: hex(0x111111),
-            surface_2: hex(0x20201f),
-            surface_hover: hex(0x262625),
-            border: hexa(0xffffff1a),
-            border_soft: hexa(0xffffff14),
-            text: hex(0xffffff),
-            text_muted: hex(0xc3c2b7),
-            text_faint: hex(0x898781),
-            accent: hex(0xc6613f),
-            sidebar_text: hex(0xc3c2b7),
-            row_hover: hexa(0xffffff13),
-            row_active: hexa(0xffffff1a),
-            composer_bg: hex(0x20201f),
-            composer_ring: hexa(0xffffff1a),
-            composer_ring_hover: hexa(0xffffff33),
-            menu_bg: hex(0x20201f),
-            fill: hexa(0xffffff0d),
-            add: hex(0x32d74b),
-            del: hex(0xff2c56),
-            link: hex(0x6da7ec),
-            focus_ring: hex(0x5598e7),
-            danger: hex(0xe5484d),
-            warning: hex(0xe2b03f),
-            success: hex(0x4caf7d),
-            selection: hex(0x3d3d3d),
-            scroll_thumb: hexa(0xe1e0d959),
+            bg: hex(0x131316),
+            sidebar: hex(0x0c0c0e),
+            raised: hex(0x1a1a1f),
+            surface_2: hex(0x18181c),
+            surface_hover: hex(0x202026),
+            border: hexa(0xffffff1c),
+            border_soft: hexa(0xffffff10),
+            text: hex(0xececf1),
+            text_muted: hex(0xb0b2ba),
+            text_faint: hex(0x777983),
+            accent: hex(0x8e9cff),
+            accent_soft: hexa(0x8e9cff24),
+            accent_text: hex(0x0c0c14),
+            sidebar_text: hex(0xb0b2ba),
+            row_hover: hexa(0xffffff0d),
+            row_active: hexa(0xffffff15),
+            composer_bg: hex(0x1a1a1f),
+            composer_ring: hexa(0xffffff17),
+            composer_ring_hover: hexa(0xffffff2b),
+            menu_bg: hex(0x1c1c22),
+            fill: hexa(0xffffff0a),
+            add: hex(0x4ac26b),
+            del: hex(0xf0616d),
+            link: hex(0x9aa7ff),
+            focus_ring: hex(0x8e9cff),
+            danger: hex(0xf0616d),
+            warning: hex(0xe8b558),
+            success: hex(0x4cc38a),
+            selection: hexa(0x8e9cff47),
+            scroll_thumb: hexa(0xffffff33),
         }
     }
 
     pub fn light() -> Self {
         Palette {
             dark: false,
-            bg: hex(0xf8f8f6),
-            sidebar: hex(0xf7f7f4),
-            surface_2: hex(0xefeee7),
-            surface_hover: hex(0xefeeeb),
-            border: hex(0xdddddd),
-            border_soft: hexa(0x00000014),
-            text: hex(0x121212),
-            text_muted: hex(0x3d3d3a),
-            text_faint: hex(0x7b7974),
-            accent: hex(0xc9663f),
-            sidebar_text: hex(0x3d3d3a),
-            row_hover: hexa(0x0000000f),
-            row_active: hexa(0x00000014),
+            bg: hex(0xffffff),
+            sidebar: hex(0xf3f3f5),
+            raised: hex(0xffffff),
+            surface_2: hex(0xf6f6f8),
+            surface_hover: hex(0xefeff2),
+            border: hexa(0x0000001c),
+            border_soft: hexa(0x00000010),
+            text: hex(0x18181b),
+            text_muted: hex(0x4b4d55),
+            text_faint: hex(0x878992),
+            accent: hex(0x5865e8),
+            accent_soft: hexa(0x5865e81c),
+            accent_text: hex(0xffffff),
+            sidebar_text: hex(0x4b4d55),
+            row_hover: hexa(0x0000000b),
+            row_active: hexa(0x00000013),
             composer_bg: hex(0xffffff),
             composer_ring: hexa(0x0000001a),
-            composer_ring_hover: hexa(0x00000033),
+            composer_ring_hover: hexa(0x0000002e),
             menu_bg: hex(0xffffff),
-            fill: hexa(0x1f1e1d0b),
-            add: hex(0x15803d),
-            del: hex(0xd1243f),
-            link: hex(0x2a78d6),
-            focus_ring: hex(0x5598e7),
-            danger: hex(0xd1243f),
+            fill: hexa(0x0000000a),
+            add: hex(0x1a7f37),
+            del: hex(0xcf222e),
+            link: hex(0x4553d6),
+            focus_ring: hex(0x5865e8),
+            danger: hex(0xcf222e),
             warning: hex(0xb7791f),
-            success: hex(0x15803d),
-            selection: hex(0xd8d6cc),
-            scroll_thumb: hexa(0x1f1e1d40),
+            success: hex(0x1a7f37),
+            selection: hexa(0x5865e833),
+            scroll_thumb: hexa(0x00000033),
         }
     }
 
@@ -117,6 +127,14 @@ impl Palette {
             WindowAppearance::Dark | WindowAppearance::VibrantDark => Palette::dark(),
             WindowAppearance::Light | WindowAppearance::VibrantLight => Palette::light(),
         }
+    }
+}
+
+pub fn resolve(theme: ThemeChoice, system: WindowAppearance) -> WindowAppearance {
+    match theme {
+        ThemeChoice::System => system,
+        ThemeChoice::Dark => WindowAppearance::Dark,
+        ThemeChoice::Light => WindowAppearance::Light,
     }
 }
 
@@ -149,26 +167,29 @@ pub fn apply(appearance: WindowAppearance, window: Option<&mut Window>, cx: &mut
         colors.accent_foreground = palette.text;
         colors.popover = palette.menu_bg;
         colors.popover_foreground = palette.text;
-        colors.primary = palette.text;
-        colors.primary_foreground = palette.bg;
+        colors.primary = palette.accent;
+        colors.primary_foreground = palette.accent_text;
+        colors.primary_hover = palette.accent.opacity(0.9);
+        colors.primary_active = palette.accent.opacity(0.8);
         colors.secondary = palette.fill;
         colors.secondary_foreground = palette.text;
         colors.secondary_hover = palette.row_hover;
         colors.secondary_active = palette.row_active;
         colors.list = palette.bg;
         colors.list_hover = palette.row_hover;
-        colors.list_active = palette.row_active;
+        colors.list_active = palette.accent_soft;
         colors.list_active_border = transparent_black();
         colors.link = palette.link;
         colors.danger = palette.danger;
         colors.warning = palette.warning;
         colors.success = palette.success;
+        colors.switch = palette.accent;
         colors.title_bar = palette.sidebar;
         colors.title_bar_border = palette.sidebar;
         colors.sidebar = palette.sidebar;
         colors.sidebar_foreground = palette.sidebar_text;
         colors.sidebar_border = palette.sidebar;
-        colors.sidebar_accent = palette.row_hover;
+        colors.sidebar_accent = palette.row_active;
         colors.sidebar_accent_foreground = palette.text;
         colors.window_border = palette.border;
         colors.scrollbar = transparent_black();

@@ -1,91 +1,63 @@
-use std::fs;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use gpui_kit::{App, Global};
-use quill_agent::Access;
-use serde::{Deserialize, Serialize};
+use quill_config::{Settings, settings_path};
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
+pub use quill_config::{app_dir, personal_instructions_path, read_personal_instructions, write_personal_instructions};
+
 pub struct Config {
-    pub server_url: String,
-    pub model: Option<String>,
-    pub thinking: bool,
-    #[serde(alias = "mode")]
-    pub access: Access,
-    pub projects: Vec<PathBuf>,
-    pub pinned_models: Vec<String>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            server_url: "http://127.0.0.1:9931".into(),
-            model: None,
-            thinking: true,
-            access: Access::Full,
-            projects: Vec::new(),
-            pinned_models: Vec::new(),
-        }
-    }
+    settings: Settings,
+    error: Option<String>,
+    read_at: Option<SystemTime>,
 }
 
 impl Global for Config {}
 
-pub fn home_dir() -> PathBuf {
-    std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from).unwrap_or_default()
-}
-
-pub fn app_dir() -> PathBuf {
-    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(home_dir).join("quill-code")
-}
-
-pub fn projects_dir() -> PathBuf {
-    home_dir().join(".quill-code").join("projects")
-}
-
-pub fn worktrees_dir() -> PathBuf {
-    home_dir().join(".quill-code").join("worktrees")
-}
-
-pub fn personal_instructions_path() -> PathBuf {
-    home_dir().join(".quill-code").join("AGENTS.md")
-}
-
-pub fn read_personal_instructions() -> String {
-    fs::read_to_string(personal_instructions_path()).unwrap_or_default()
-}
-
-pub fn write_personal_instructions(text: &str) -> std::io::Result<()> {
-    let path = personal_instructions_path();
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    fs::write(path, text)
+fn modified() -> Option<SystemTime> {
+    std::fs::metadata(settings_path()).and_then(|m| m.modified()).ok()
 }
 
 impl Config {
     pub fn load() -> Config {
-        fs::read_to_string(app_dir().join("config.json")).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+        let loaded = quill_config::load();
+        Config { settings: loaded.settings, error: loaded.error, read_at: modified() }
     }
 
-    pub fn get(cx: &App) -> &Config {
-        cx.global::<Config>()
+    pub fn get(cx: &App) -> &Settings {
+        &cx.global::<Config>().settings
     }
 
-    pub fn update(cx: &mut App, edit: impl FnOnce(&mut Config)) {
+    pub fn error(cx: &App) -> Option<String> {
+        cx.global::<Config>().error.clone()
+    }
+
+    pub fn update(cx: &mut App, edit: impl FnOnce(&mut Settings)) {
         let config = cx.global_mut::<Config>();
-        edit(config);
-        let dir = app_dir();
-        if let Ok(text) = serde_json::to_string_pretty(config) {
-            let _ = fs::create_dir_all(&dir).and_then(|_| fs::write(dir.join("config.json"), text));
+        edit(&mut config.settings);
+        if config.error.is_none() && quill_config::save(&config.settings).is_ok() {
+            config.read_at = modified();
+        }
+    }
+
+    pub fn reload(cx: &mut App) -> bool {
+        if cx.global::<Config>().read_at == modified() {
+            return false;
+        }
+        cx.set_global(Config::load());
+        true
+    }
+
+    pub fn replace(cx: &mut App, settings: Settings) {
+        let config = cx.global_mut::<Config>();
+        config.error = None;
+        config.settings = settings;
+        if quill_config::save(&config.settings).is_ok() {
+            config.read_at = modified();
         }
     }
 
     pub fn add_project(cx: &mut App, path: PathBuf) {
-        Config::update(cx, |config| {
-            config.projects.retain(|p| p != &path);
-            config.projects.insert(0, path);
-        });
+        Config::update(cx, |settings| settings.add_project(path));
     }
 }

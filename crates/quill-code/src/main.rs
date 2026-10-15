@@ -8,14 +8,13 @@ mod commit_dialog;
 mod composer;
 mod config;
 mod context_ring;
-mod git;
-mod github;
 mod icons;
 mod mentions;
+mod model_settings;
+mod motion;
 mod palette;
 mod panel;
 mod project;
-mod publish;
 mod settings;
 mod shell;
 mod smooth_scroll;
@@ -24,6 +23,7 @@ mod terminal;
 mod thread;
 mod thread_view;
 mod ui;
+mod usage;
 mod version;
 mod weave;
 mod workspace;
@@ -47,7 +47,9 @@ fn main() {
         gpui_kit::init(cx);
         load_fonts(cx);
         cx.set_global(config::Config::load());
-        palette::apply(cx.window_appearance(), None, cx);
+        let appearance = config::Config::get(cx).appearance.clone();
+        motion::apply(appearance.motion, cx);
+        palette::apply(palette::resolve(appearance.theme, cx.window_appearance()), None, cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();

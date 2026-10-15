@@ -1,21 +1,19 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 
-use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
-use gpui_kit::{
-    Context, Div, Entity, EventEmitter, FontWeight, IntoElement, MouseButton, ParentElement, Render, SharedString, Stateful, Styled,
-    Window, div, prelude::*, px,
-};
-use quill_llama::{ChatRequest, Event, Message, Server};
-
-use crate::git::{self, FileStatus};
-use crate::github::{self, Visibility};
+use crate::backend::Writer;
 use crate::icons::Icon;
 use crate::palette::{Palette, palette};
 use crate::project;
 use crate::thread_view::file_icon;
 use crate::ui::{MONO, icon};
+use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_kit::{
+    Context, Div, Entity, EventEmitter, FontWeight, IntoElement, MouseButton, ParentElement, Render, SharedString, Stateful, Styled,
+    Window, div, prelude::*, px,
+};
+use quill_git::github::{self, Visibility};
+use quill_git::{self as git, FileStatus};
 
 pub enum CommitEvent {
     Close,
@@ -43,14 +41,13 @@ pub struct CommitDialog {
     new_branch: Option<Entity<InputState>>,
     stage: Stage,
     error: Option<String>,
-    server_url: String,
-    model: Option<String>,
+    writer: Result<Writer, String>,
 }
 
 impl EventEmitter<CommitEvent> for CommitDialog {}
 
 impl CommitDialog {
-    pub fn new(root: PathBuf, server_url: String, model: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(root: PathBuf, writer: Result<Writer, String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let message = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder("Describe the change, or leave this empty and the model will write it")
@@ -74,8 +71,7 @@ impl CommitDialog {
             new_branch: None,
             stage: Stage::Ready,
             error,
-            server_url,
-            model,
+            writer,
         }
     }
 
@@ -121,7 +117,7 @@ impl CommitDialog {
             return;
         }
         let message = self.message.read(cx).value().trim().to_string();
-        let (root, url, model) = (self.root.clone(), self.server_url.clone(), self.model.clone());
+        let (root, writer) = (self.root.clone(), self.writer.clone());
         self.error = None;
         self.stage = Stage::Working(if message.is_empty() { "Writing a commit message" } else { "Committing" });
         cx.notify();
@@ -130,7 +126,7 @@ impl CommitDialog {
                 git::create_branch(&root, name)?;
             }
             git::stage(&root, &files)?;
-            let message = if message.is_empty() { write_message(&root, &url, model.as_deref())? } else { message };
+            let message = if message.is_empty() { write_message(&root, writer)? } else { message };
             let sha = git::commit(&root, &files, &message)?;
             Ok::<_, String>((sha, git::branch(&root).unwrap_or_default()))
         });
@@ -264,31 +260,10 @@ impl CommitDialog {
     }
 }
 
-fn write_message(root: &std::path::Path, url: &str, model: Option<&str>) -> Result<String, String> {
-    let model = model.ok_or("Choose a model first, or type a commit message yourself.")?;
-    let request = ChatRequest {
-        model: model.to_string(),
-        messages: vec![
-            Message::system(
-                "You write git commit messages. Reply with the message only: one summary line in the imperative mood under 72 characters, then, only if it helps, a blank line and a few short bullet points.",
-            ),
-            Message::user(git::staged_diff(root, 12_000)),
-        ],
-        thinking: Some(false),
-        tools: Vec::new(),
-    };
-    let mut text = String::new();
-    Server::new(url)
-        .stream_chat(&request, &AtomicBool::new(false), |event| {
-            if let Event::Content(chunk) = event {
-                text.push_str(&chunk);
-            }
-        })
-        .map_err(|e| e.to_string())?;
-    let text = match text.rfind("</think>") {
-        Some(end) => text[end + 8..].to_string(),
-        None => text,
-    };
+const COMMIT_SYSTEM: &str = "You write git commit messages. Reply with the message only: one summary line in the imperative mood under 72 characters, then, only if it helps, a blank line and a few short bullet points.";
+
+fn write_message(root: &std::path::Path, writer: Result<Writer, String>) -> Result<String, String> {
+    let text = writer?.write(COMMIT_SYSTEM, &git::staged_diff(root, 12_000))?;
     let text = text.trim().trim_matches('`').trim().to_string();
     if text.is_empty() { Err("The model returned an empty message. Type one yourself.".into()) } else { Ok(text) }
 }
@@ -303,7 +278,7 @@ fn check(on: bool, p: Palette) -> Div {
         .rounded(px(4.))
         .border_1()
         .border_color(if on { p.text } else { p.border })
-        .when(on, |b| b.bg(p.text).child(icon(Icon::Check, 12., p.bg)))
+        .when(on, |b| b.bg(p.accent).border_color(p.accent).child(icon(Icon::Check, 12., p.accent_text)))
 }
 
 fn button(id: &'static str, label: impl Into<SharedString>, primary: bool, p: Palette) -> Stateful<Div> {
@@ -319,7 +294,7 @@ fn button(id: &'static str, label: impl Into<SharedString>, primary: bool, p: Pa
         .cursor_pointer()
         .map(|b| {
             if primary {
-                b.bg(p.text).text_color(p.bg).font_weight(FontWeight::SEMIBOLD).hover(|s| s.opacity(0.9))
+                b.bg(p.accent).text_color(p.accent_text).font_weight(FontWeight::SEMIBOLD).hover(|s| s.opacity(0.9))
             } else {
                 b.border_1().border_color(p.border).text_color(p.text).hover(move |s| s.bg(p.row_hover))
             }

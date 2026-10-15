@@ -6,13 +6,13 @@ use gpui_kit::{
     SharedString, Styled, Subscription, Window, div, prelude::*, px,
 };
 
-use crate::config::projects_dir;
-use crate::git;
-use crate::github::Visibility;
+use crate::config::Config;
 use crate::icons::Icon;
 use crate::palette::{Palette, palette};
 use crate::project;
 use crate::ui::{MONO, icon};
+use quill_git as git;
+use quill_git::github::Visibility;
 
 pub enum AddProjectEvent {
     Added(PathBuf, Option<String>),
@@ -137,12 +137,16 @@ impl AddProject {
                 let name = self.value(cx);
                 let git_branch = self.git.then_some(branch);
                 let visibility = self.visibility.filter(|_| self.git);
-                self.run(cx, move || project::create(&name, git_branch.as_deref(), visibility).map(|created| (created.path, created.note)));
+                let base = Config::get(cx).projects_dir();
+                self.run(cx, move || {
+                    project::create(&base, &name, git_branch.as_deref(), visibility).map(|created| (created.path, created.note))
+                });
             }
             Step::GitUrl => {
                 let url = self.value(cx);
                 if !url.is_empty() {
-                    self.run(cx, move || project::clone(&url).map(|path| (path, None)));
+                    let base = Config::get(cx).projects_dir();
+                    self.run(cx, move || project::clone(&base, &url).map(|path| (path, None)));
                 }
             }
         }
@@ -300,7 +304,7 @@ fn key_hint(key: &'static str, label: &'static str, p: Palette) -> impl IntoElem
 impl Render for AddProject {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let home = projects_dir().display().to_string();
+        let home = Config::get(cx).projects_dir().display().to_string();
         let body = match self.step {
             Step::Sources => {
                 let sources = self.sources(cx);

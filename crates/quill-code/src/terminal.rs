@@ -10,10 +10,10 @@ use gpui_kit::{
     Subscription, UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 
-use crate::git::hidden;
 use crate::icons::Icon;
 use crate::palette::palette;
 use crate::ui::{MONO, icon};
+use quill_git::hidden;
 
 const DONE: &str = "__quill_done__";
 const MAX_LINES: usize = 5000;

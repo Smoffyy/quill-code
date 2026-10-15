@@ -112,9 +112,3 @@ fn paint(bounds: Bounds<Pixels>, params: &Params, clock: &Clock, poke: f64, opac
         window.paint_quad(fill(bounds, color.opacity(alpha)).corner_radii(px(r as f32)));
     }
 }
-
-pub fn model_mark(model: &str, side: f32, color: Hsla) -> impl IntoElement + use<> {
-    let clock = Clock::seeded(name_hash(model) as u64);
-    let params = State::Idle.params();
-    canvas(|_, _, _| (), move |bounds, _, window, _| paint(bounds, &params, &clock, 0.0, 1.0, color, window)).size(px(side)).flex_shrink_0()
-}

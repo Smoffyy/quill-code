@@ -2,7 +2,7 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::{Bounds, Div, Hsla, ParentElement, PathBuilder, Pixels, Stateful, Styled, Window, canvas, div, point, prelude::*, px};
-use quill_llama::context_label;
+use quill_providers::context_label;
 
 use crate::palette::Palette;
 

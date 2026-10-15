@@ -4,22 +4,25 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::{
-    Context, Entity, EventEmitter, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Window, div,
-    prelude::*, px, uniform_list,
+    AnimationExt, Context, Entity, EventEmitter, FontWeight, IntoElement, ParentElement, Render, SharedString, SpringAnimation,
+    SpringConfig, Styled, Subscription, Window, div, prelude::*, px, uniform_list,
 };
-use quill_agent::FileDiff;
+use quill_core::FileDiff;
 
 use crate::icons::Icon;
 use crate::palette::{Palette, palette};
 use crate::thread_view::{diff_lines, file_icon};
 use crate::ui::{MONO, icon};
+use crate::usage::UsageView;
 
 const SKIP: [&str; 6] = [".git", "node_modules", "target", ".venv", "__pycache__", ".next"];
+const TAB_WIDTH: f32 = 96.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Diff,
     Files,
+    Usage,
 }
 
 pub struct ClosePanel;
@@ -46,6 +49,7 @@ struct DiffFile {
 
 pub struct Panel {
     pub tab: Tab,
+    usage: Entity<UsageView>,
     root: Option<PathBuf>,
     title: String,
     files: Vec<DiffFile>,
@@ -87,7 +91,7 @@ fn collect(dir: &Path, needle: &str, out: &mut Vec<PathBuf>) {
 }
 
 impl Panel {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(usage: Entity<UsageView>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search files"));
         let subscription = cx.subscribe(&search, |this, search, event: &InputEvent, cx| {
             if let InputEvent::Change = event {
@@ -101,6 +105,7 @@ impl Panel {
         });
         Panel {
             tab: Tab::Diff,
+            usage,
             root: None,
             title: String::new(),
             files: Vec::new(),
@@ -156,6 +161,11 @@ impl Panel {
         cx.notify();
     }
 
+    pub fn show_usage(&mut self, cx: &mut Context<Self>) {
+        self.tab = Tab::Usage;
+        cx.notify();
+    }
+
     fn select(&mut self, tab: Tab, cx: &mut Context<Self>) {
         self.tab = tab;
         cx.notify();
@@ -204,20 +214,53 @@ impl Panel {
         let on = self.tab == tab;
         div()
             .id(label)
+            .w(px(TAB_WIDTH))
             .flex()
             .items_center()
+            .justify_center()
             .gap(px(6.))
-            .h(px(28.))
-            .px(px(10.))
+            .h(px(26.))
             .rounded(px(8.))
             .text_size(px(13.))
             .text_color(if on { p.text } else { p.text_faint })
-            .when(on, |b| b.bg(p.row_active))
             .cursor_pointer()
             .hover(move |style| style.text_color(p.text))
             .child(icon(name, 14., if on { p.text } else { p.text_faint }))
             .child(label)
             .on_click(cx.listener(move |this, _, _, cx| this.select(tab, cx)))
+    }
+
+    fn tabs(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let index = match self.tab {
+            Tab::Diff => 0.,
+            Tab::Files => 1.,
+            Tab::Usage => 2.,
+        };
+        div()
+            .relative()
+            .flex()
+            .p(px(3.))
+            .rounded(px(10.))
+            .bg(p.fill)
+            .child(
+                div()
+                    .absolute()
+                    .top(px(3.))
+                    .w(px(TAB_WIDTH))
+                    .h(px(26.))
+                    .rounded(px(8.))
+                    .bg(p.raised)
+                    .border_1()
+                    .border_color(p.border_soft)
+                    .with_spring(
+                        "panel-tab-indicator",
+                        SpringAnimation::new(SpringConfig::new(420., 40., 1.)).to(px(3. + index * TAB_WIDTH)),
+                        |el, x| el.left(x),
+                    ),
+            )
+            .child(self.tab_button(Tab::Diff, Icon::FileDiff, "Review", p, cx))
+            .child(self.tab_button(Tab::Files, Icon::Files, "Files", p, cx))
+            .child(self.tab_button(Tab::Usage, Icon::Gauge, "Usage", p, cx))
     }
 
     fn diff_tab(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -475,6 +518,7 @@ impl Render for Panel {
         let body = match self.tab {
             Tab::Diff => self.diff_tab(p, cx).into_any_element(),
             Tab::Files => self.files_tab(p, cx).into_any_element(),
+            Tab::Usage => self.usage.clone().into_any_element(),
         };
         div()
             .size_full()
@@ -491,8 +535,7 @@ impl Render for Panel {
                     .px(px(8.))
                     .border_b_1()
                     .border_color(p.border_soft)
-                    .child(self.tab_button(Tab::Diff, Icon::FileDiff, "Review", p, cx))
-                    .child(self.tab_button(Tab::Files, Icon::Files, "Files", p, cx))
+                    .child(self.tabs(p, cx))
                     .child(div().flex_1())
                     .child(
                         div()

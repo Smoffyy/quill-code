@@ -1,5 +1,5 @@
 [package]
-name = "quill-agent"
+name = "quill-git"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,7 +7,5 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
-quill-llama.workspace = true
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-similar = "3"
+ureq = { version = "3.4.2", default-features = false, features = ["json", "native-tls"] }

@@ -8,8 +8,10 @@ publish.workspace = true
 
 [dependencies]
 base64 = "0.23"
-quill-agent.workspace = true
-quill-llama.workspace = true
+quill-config.workspace = true
+quill-core.workspace = true
+quill-git.workspace = true
+quill-providers.workspace = true
 quill-weave.workspace = true
 futures = "0.3"
 gpui-kit.workspace = true

@@ -16,10 +16,10 @@ fn expand_imports(root: &Path, text: &str) -> String {
         .join("\n")
 }
 
-pub fn project_instructions(root: &Path) -> String {
+pub fn project_instructions(root: &Path, files: &[String]) -> String {
     let mut seen: Vec<String> = Vec::new();
     let mut parts = Vec::new();
-    for name in ["AGENTS.md", "CLAUDE.md", "GEMINI.md", ".github/copilot-instructions.md"] {
+    for name in files {
         let Ok(raw) = fs::read_to_string(root.join(name)) else { continue };
         let text = expand_imports(root, &raw).trim().to_string();
         if text.is_empty() || seen.contains(&text) {
@@ -50,7 +50,8 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("AGENTS.md"), "Use tabs.").unwrap();
         fs::write(dir.join("CLAUDE.md"), "@AGENTS.md").unwrap();
-        let text = project_instructions(&dir);
+        let files: Vec<String> = ["AGENTS.md", "CLAUDE.md"].iter().map(|s| s.to_string()).collect();
+        let text = project_instructions(&dir, &files);
         assert_eq!(text.matches("Use tabs.").count(), 1);
         assert!(text.starts_with("## AGENTS.md"));
         fs::remove_dir_all(&dir).unwrap();

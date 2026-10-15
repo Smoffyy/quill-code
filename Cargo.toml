@@ -10,8 +10,10 @@ authors = ["Smoffyy"]
 publish = false
 
 [workspace.dependencies]
-quill-agent = { path = "crates/quill-agent" }
-quill-llama = { path = "crates/quill-llama" }
+quill-config = { path = "crates/quill-config" }
+quill-core = { path = "crates/quill-core" }
+quill-git = { path = "crates/quill-git" }
+quill-providers = { path = "crates/quill-providers" }
 quill-weave = { path = "crates/quill-weave" }
 gpui-kit = "0.7.3"
 

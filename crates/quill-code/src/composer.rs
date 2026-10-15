@@ -1,31 +1,34 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState, Position, Textarea, TextareaState};
 use gpui_kit::{
-    Anchor, App, Context, Div, Entity, EventEmitter, ExternalPaths, Focusable, FontWeight, IntoElement, KeystrokeEvent, ObjectFit,
-    ParentElement, PathPromptOptions, Render, SharedString, Stateful, Styled, Subscription, Window, div, img, prelude::*, px, svg,
+    Anchor, App, Context, Div, Entity, EventEmitter, ExternalPaths, Focusable, FontWeight, Hsla, IntoElement, KeystrokeEvent, ObjectFit,
+    ParentElement, PathPromptOptions, Render, SharedString, Stateful, Styled, Subscription, Window, div, img, prelude::*, px,
 };
-use quill_agent::{Access, Decision};
-use quill_llama::{Model, Status, Thinking, context_label};
+use quill_config::{ModelRef, ProviderKind};
+use quill_core::{Access, Decision, FileDiff};
+use quill_providers::{Model, Status, context_label};
 use quill_weave::State;
 
 use crate::attachments::Attachment;
-use crate::backend::{Backend, Connection};
+use crate::backend::{Backend, Connection, Control, Source, provider_icon};
 use crate::config::Config;
 use crate::context_ring;
-use crate::git::{self, Branches};
 use crate::icons::Icon;
 use crate::mentions::{self, Command, Trigger};
 use crate::palette::{Palette, palette};
 use crate::project;
-use crate::ui::{MONO, icon, menu_item, menu_label, menu_panel, popup, separator};
-use crate::weave::{WeaveMark, model_mark};
+use crate::ui::{MONO, Tone, button, icon, kbd, menu_item, menu_label, menu_panel, popup, separator, tip};
+use crate::weave::WeaveMark;
 use crate::workspace::Prompt;
+use quill_git::{self as git, Branches};
 
 pub enum ComposerEvent {
     Submit(Prompt),
     Stop,
     Decide(Decision),
+    Answer(String),
     OpenModelSettings,
     Command(Command),
     SetIsolated(bool),
@@ -36,9 +39,18 @@ pub enum ComposerEvent {
 
 #[derive(Clone)]
 pub struct ApprovalCard {
-    pub title: &'static str,
+    pub title: String,
     pub target: String,
     pub stats: Option<(usize, usize)>,
+    pub diffs: Vec<FileDiff>,
+    pub similar: Option<String>,
+    pub tool: String,
+}
+
+#[derive(Clone)]
+pub struct QuestionCard {
+    pub question: String,
+    pub options: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -60,6 +72,12 @@ enum Menu {
     Workspace,
     Branch,
     ApprovalMore,
+}
+
+#[derive(Clone, PartialEq)]
+enum ModelTab {
+    Pinned,
+    Source(String),
 }
 
 #[derive(Clone, PartialEq)]
@@ -86,9 +104,13 @@ pub struct Composer {
     branch_error: Option<String>,
     backend: Entity<Backend>,
     mark: Entity<WeaveMark>,
+    marks: HashMap<String, Entity<WeaveMark>>,
     menu: Option<Menu>,
+    model_tab: Option<ModelTab>,
     busy: bool,
     approval: Option<ApprovalCard>,
+    question: Option<QuestionCard>,
+    show_diff: bool,
     strip: Option<Strip>,
     attachments: Vec<Attachment>,
     context_used: Option<u64>,
@@ -147,9 +169,13 @@ impl Composer {
             branch_error: None,
             backend,
             mark: cx.new(|_| WeaveMark::new(State::Idle)),
+            marks: HashMap::new(),
             menu: None,
+            model_tab: None,
             busy: false,
             approval: None,
+            question: None,
+            show_diff: false,
             strip: None,
             attachments: Vec::new(),
             context_used: None,
@@ -168,13 +194,18 @@ impl Composer {
         &mut self,
         busy: bool,
         approval: Option<ApprovalCard>,
+        question: Option<QuestionCard>,
         strip: Option<Strip>,
         context_used: Option<u64>,
         cx: &mut Context<Self>,
     ) {
         self.busy = busy;
         self.context_used = context_used;
+        if approval.as_ref().map(|a| &a.target) != self.approval.as_ref().map(|a| &a.target) {
+            self.show_diff = false;
+        }
         self.approval = approval;
+        self.question = question;
         if self.strip.as_ref().map(|s| &s.root) != strip.as_ref().map(|s| &s.root) {
             self.files = None;
         }
@@ -193,13 +224,14 @@ impl Composer {
             && !modifiers.shift
             && let Some(index) = key.parse::<usize>().ok().filter(|n| (1..=9).contains(n))
         {
-            let pinned = Config::get(cx).pinned_models.clone();
-            if let Some(id) = pinned.get(index - 1).cloned() {
-                self.backend.update(cx, |backend, cx| backend.select(id, cx));
+            let pinned = Config::get(cx).models.pinned.clone();
+            if let Some(model) = pinned.get(index - 1).cloned() {
+                self.backend.update(cx, |backend, cx| backend.select(model, cx));
                 cx.stop_propagation();
             }
             return;
         }
+        let focused = self.input.read(cx).focus_handle(cx).is_focused(window);
         if key == "escape" {
             if self.menu.is_some() {
                 self.close(cx);
@@ -208,7 +240,21 @@ impl Composer {
                 self.suggestions = None;
                 cx.notify();
                 cx.stop_propagation();
+            } else if self.approval.is_some() && focused {
+                cx.emit(ComposerEvent::Decide(Decision::Decline));
+                cx.stop_propagation();
             }
+            return;
+        }
+        if key == "enter"
+            && !modifiers.shift
+            && focused
+            && self.approval.is_some()
+            && self.suggestions.is_none()
+            && self.input.read(cx).value().trim().is_empty()
+        {
+            cx.emit(ComposerEvent::Decide(Decision::Approve));
+            cx.stop_propagation();
             return;
         }
         let Some(count) = self.suggestions.as_ref().map(Suggestions::len) else { return };
@@ -276,10 +322,14 @@ impl Composer {
         match command {
             Command::Model => self.open(Menu::Model, window, cx),
             Command::Mode => self.open(Menu::Access, window, cx),
-            Command::Reasoning => {
-                let on = !Config::get(cx).thinking;
-                self.backend.update(cx, |backend, cx| backend.set_thinking(on, cx));
-            }
+            Command::Reasoning => match self.backend.read(cx).control(cx) {
+                Control::Toggle => {
+                    let on = !Config::get(cx).models.thinking;
+                    self.backend.update(cx, |backend, cx| backend.set_thinking(on, cx));
+                }
+                Control::Effort(_) => self.open(Menu::Thinking, window, cx),
+                Control::None => {}
+            },
             Command::Init if !self.busy => {
                 cx.emit(ComposerEvent::Submit(Prompt { text: mentions::INIT_PROMPT.into(), attachments: Vec::new() }));
             }
@@ -288,10 +338,18 @@ impl Composer {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.suggestions.is_some() {
+        if self.suggestions.is_some() {
             return;
         }
         let text = self.input.read(cx).value().trim().to_string();
+        if self.question.is_some() && !text.is_empty() {
+            self.input.update(cx, |input, cx| input.set_value("", window, cx));
+            cx.emit(ComposerEvent::Answer(text));
+            return;
+        }
+        if self.busy && text.is_empty() {
+            return;
+        }
         if text.is_empty() && self.attachments.is_empty() {
             return;
         }
@@ -335,6 +393,7 @@ impl Composer {
             });
         }
         if menu == Menu::Model {
+            self.model_tab = None;
             self.backend.update(cx, |backend, cx| backend.refresh(cx));
             self.search.update(cx, |search, cx| {
                 search.set_value("", window, cx);
@@ -359,32 +418,61 @@ impl Composer {
 
     fn model_label(&self, cx: &App) -> (bool, SharedString) {
         let backend = self.backend.read(cx);
-        if let Some(model) = backend.selected(cx) {
-            return (true, model.id.clone().into());
+        if let Some((_, model)) = backend.selected(cx) {
+            return (true, model.label().to_string().into());
         }
-        match (&backend.connection, Backend::selected_id(cx)) {
-            (Connection::Checking, Some(id)) => (true, id.into()),
-            (Connection::Online, _) if !backend.models.is_empty() => (false, "Choose a model".into()),
-            (Connection::Checking, None) => (false, "Connecting".into()),
+        let checking = backend.sources.iter().any(|s| s.connection == Connection::Checking);
+        match Backend::selected_ref(cx) {
+            Some(selected) if checking => (true, selected.model.into()),
+            _ if backend.sources.iter().any(|s| s.ready() && !s.models.is_empty()) => (false, "Choose a model".into()),
+            _ if checking => (false, "Connecting".into()),
             _ => (false, "No model connected".into()),
         }
     }
 
-    fn model_row(&self, model: &Model, shortcut: Option<usize>, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn model_mark(&mut self, model: &str, cx: &mut Context<Self>) -> Entity<WeaveMark> {
+        self.marks.entry(model.to_string()).or_insert_with(|| cx.new(|_| WeaveMark::new(State::Idle).seeded(model))).clone()
+    }
+
+    fn model_row(&mut self, source: &Source, model: &Model, shortcut: Option<usize>, cx: &mut Context<Self>) -> Stateful<Div> {
         let p = palette(cx);
-        let id = model.id.clone();
-        let pin_id = model.id.clone();
-        let selected = Backend::selected_id(cx).as_deref() == Some(model.id.as_str());
-        let pinned = Config::get(cx).pinned_models.contains(&model.id);
-        let mut detail = vec![model.status.label().to_string()];
+        let backend_logo = source.config.kind != ProviderKind::Local;
+        let mark = if backend_logo {
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon(provider_icon(source.config.kind), 18., p.text))
+                .into_any_element()
+        } else {
+            self.model_mark(&model.id, cx).into_any_element()
+        };
+        let target = ModelRef::new(source.config.id.clone(), model.id.clone());
+        let selected = Backend::selected_ref(cx).as_ref() == Some(&target);
+        let pinned = Config::get(cx).models.pinned.contains(&target);
+        let local = source.config.kind == ProviderKind::Local;
+        let mut detail = Vec::new();
+        if local {
+            detail.push(model.status.label().to_string());
+        }
         if let Some(context) = model.context {
             detail.push(format!("{} context", context_label(context)));
         }
         if model.vision {
             detail.push("Vision".into());
         }
+        if !model.efforts.is_empty() {
+            detail.push("Reasoning".into());
+        }
+        if model.name.is_some() && !local {
+            detail.push(model.id.clone());
+        }
+        let ready = !local || model.status == Status::Loaded;
+        let key = format!("{}-{}", source.config.id, model.id);
+        let pin_target = target.clone();
         div()
-            .id(SharedString::from(format!("model-{id}")))
+            .id(SharedString::from(format!("model-{key}")))
             .flex()
             .items_center()
             .gap(px(10.))
@@ -394,43 +482,28 @@ impl Composer {
             .cursor_pointer()
             .when(selected, |row| row.bg(p.row_active))
             .hover(move |style| style.bg(p.row_hover))
-            .child(
-                div().relative().flex_shrink_0().child(model_mark(&model.id, 24., p.text)).child(
-                    div()
-                        .absolute()
-                        .right_0()
-                        .bottom_0()
-                        .size(px(8.))
-                        .rounded_full()
-                        .border_1()
-                        .border_color(p.menu_bg)
-                        .bg(if model.status == Status::Loaded { p.success } else { p.text_faint.opacity(0.5) }),
-                ),
-            )
+            .child(div().relative().flex_shrink_0().size(px(24.)).child(mark).child(
+                div().absolute().right_0().bottom_0().size(px(8.)).rounded_full().border_1().border_color(p.menu_bg).bg(if ready {
+                    p.success
+                } else {
+                    p.text_faint.opacity(0.5)
+                }),
+            ))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .child(div().text_size(px(13.5)).text_color(p.text).child(model.id.clone()))
-                    .child(div().text_size(px(12.)).text_color(p.text_faint).child(detail.join(" · "))),
+                    .child(div().text_size(px(13.5)).text_color(p.text).child(model.label().to_string()))
+                    .when(!detail.is_empty(), |col| {
+                        col.child(div().text_size(px(12.)).text_color(p.text_faint).text_ellipsis().child(detail.join(" · ")))
+                    }),
             )
-            .when_some(shortcut, |row, n| {
-                row.child(
-                    div()
-                        .px(px(5.))
-                        .rounded(px(5.))
-                        .border_1()
-                        .border_color(p.border_soft)
-                        .text_size(px(11.))
-                        .text_color(p.text_faint)
-                        .child(format!("Ctrl+{n}")),
-                )
-            })
+            .when_some(shortcut, |row, n| row.child(kbd(format!("Ctrl+{n}"), p)))
             .child(
                 div()
-                    .id(SharedString::from(format!("pin-{pin_id}")))
+                    .id(SharedString::from(format!("pin-{key}")))
                     .size(px(24.))
                     .flex()
                     .flex_shrink_0()
@@ -438,126 +511,260 @@ impl Composer {
                     .justify_center()
                     .rounded(px(6.))
                     .hover(move |style| style.bg(p.row_active))
+                    .tooltip(tip(if pinned { "Unpin" } else { "Pin to the top" }))
                     .child(icon(Icon::Pin, 13., if pinned { p.accent } else { p.text_faint.opacity(0.6) }))
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.stop_propagation();
-                        let id = pin_id.clone();
+                        let target = pin_target.clone();
                         Config::update(cx, |config| {
-                            if config.pinned_models.contains(&id) {
-                                config.pinned_models.retain(|m| *m != id);
+                            if config.models.pinned.contains(&target) {
+                                config.models.pinned.retain(|m| *m != target);
                             } else {
-                                config.pinned_models.push(id);
+                                config.models.pinned.push(target);
                             }
                         });
                         cx.notify();
                     })),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
-                let id = id.clone();
-                this.backend.update(cx, |backend, cx| backend.select(id, cx));
+                let target = target.clone();
+                this.backend.update(cx, |backend, cx| backend.select(target, cx));
                 this.close(cx);
             }))
     }
 
-    fn model_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn source_header(&self, source: &Source, cx: &App) -> Div {
         let p = palette(cx);
-        let backend = self.backend.read(cx);
-        let url = Backend::url(cx);
+        let color = match source.connection {
+            Connection::Online => p.success,
+            Connection::Checking => p.text_faint,
+            _ => p.warning,
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(10.))
+            .pt(px(8.))
+            .pb(px(4.))
+            .child(icon(provider_icon(source.config.kind), 14., p.text_muted))
+            .child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(p.text_muted).child(source.config.name.clone()))
+            .child(div().size(px(6.)).flex_shrink_0().rounded_full().bg(color))
+            .child(div().flex_1().min_w_0().text_size(px(12.)).text_color(p.text_faint).text_ellipsis().child(source.status()))
+    }
+
+    fn current_tab(&self, sources: &[Source], has_pinned: bool, cx: &App) -> Option<ModelTab> {
+        let valid = |tab: &ModelTab| match tab {
+            ModelTab::Pinned => has_pinned,
+            ModelTab::Source(id) => sources.iter().any(|s| s.config.id == *id),
+        };
+        self.model_tab
+            .clone()
+            .filter(valid)
+            .or_else(|| Backend::selected_ref(cx).map(|r| ModelTab::Source(r.provider)).filter(valid))
+            .or_else(|| sources.iter().find(|s| !s.models.is_empty()).or(sources.first()).map(|s| ModelTab::Source(s.config.id.clone())))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tab_button(
+        &self,
+        id: SharedString,
+        name: Icon,
+        label: String,
+        dot: Option<Hsla>,
+        on: bool,
+        tab: ModelTab,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let p = palette(cx);
+        div()
+            .id(id)
+            .relative()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_center()
+            .size(px(34.))
+            .rounded(px(9.))
+            .cursor_pointer()
+            .when(on, |tab| tab.bg(p.row_active))
+            .hover(move |style| style.bg(if on { p.row_active } else { p.row_hover }))
+            .tooltip(tip(label))
+            .child(icon(name, 18., if on { p.text } else { p.text_muted }))
+            .when_some(dot, |button, color| {
+                button.child(
+                    div().absolute().right(px(5.)).bottom(px(5.)).size(px(7.)).rounded_full().border_1().border_color(p.menu_bg).bg(color),
+                )
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.search.update(cx, |search, cx| search.set_value("", window, cx));
+                this.model_tab = Some(tab.clone());
+                cx.notify();
+            }))
+    }
+
+    fn model_menu(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let p = palette(cx);
         let query = self.search.read(cx).value().trim().to_lowercase();
-        let pinned_ids = Config::get(cx).pinned_models.clone();
-        let models = backend.models.clone();
-        let connection = backend.connection.clone();
-        let mut menu = menu_panel(p).w(px(360.)).child(
+        let pinned_refs = Config::get(cx).models.pinned.clone();
+        let sources: Vec<Source> = self.backend.read(cx).sources.iter().filter(|s| s.connection != Connection::Off).cloned().collect();
+        let pinned: Vec<(Source, Model)> = pinned_refs
+            .iter()
+            .filter_map(|r| {
+                let source = sources.iter().find(|s| s.config.id == r.provider)?;
+                source.models.iter().find(|m| m.id == r.model).map(|m| (source.clone(), m.clone()))
+            })
+            .collect();
+        let current = self.current_tab(&sources, !pinned.is_empty(), cx);
+        let searching = !query.is_empty();
+        let mut rail = div().flex().flex_col().items_center().gap(px(4.)).w(px(36.)).flex_shrink_0().pt(px(2.));
+        if !pinned.is_empty() {
+            let on = !searching && current == Some(ModelTab::Pinned);
+            rail = rail.child(self.tab_button("tab-pinned".into(), Icon::Pin, "Pinned".into(), None, on, ModelTab::Pinned, cx));
+        }
+        for source in &sources {
+            let color = match source.connection {
+                Connection::Online => p.success,
+                Connection::Checking => p.text_faint,
+                _ => p.warning,
+            };
+            let tab = ModelTab::Source(source.config.id.clone());
+            let on = !searching && current.as_ref() == Some(&tab);
+            let id = SharedString::from(format!("tab-{}", source.config.id));
+            rail = rail.child(self.tab_button(id, provider_icon(source.config.kind), source.config.name.clone(), Some(color), on, tab, cx));
+        }
+        rail = rail.child(div().flex_1()).child(
             div()
+                .id("server-settings")
                 .flex()
                 .items_center()
-                .gap(px(8.))
-                .px(px(10.))
-                .pt(px(6.))
-                .pb(px(6.))
-                .child(svg().path(Icon::LlamaCpp.path()).size(px(16.)).text_color(p.text))
-                .child(div().flex_1().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child("llama.cpp"))
-                .child(
-                    div()
-                        .id("refresh-models")
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .size(px(24.))
-                        .rounded(px(6.))
-                        .cursor_pointer()
-                        .hover(move |style| style.bg(p.row_hover))
-                        .child(icon(Icon::Refresh, 13., p.text_faint))
-                        .on_click(cx.listener(|this, _, _, cx| this.backend.update(cx, |b, cx| b.refresh(cx)))),
-                ),
-        );
-        menu = menu.child(search_box(&self.search, p));
-        match &connection {
-            Connection::Checking if models.is_empty() => menu = menu.child(note("Looking for models", p)),
-            Connection::Offline(error) => {
-                menu = menu
-                    .child(note(format!("Can't reach llama.cpp at {url}"), p))
-                    .child(div().px(px(10.)).pb(px(6.)).text_size(px(12.)).text_color(p.text_faint).child(error.clone()));
-            }
-            _ if models.is_empty() => menu = menu.child(note("This server has no models", p)),
-            _ => {}
-        }
-        let mut body = div().id("model-list").max_h(px(380.)).overflow_y_scroll().flex().flex_col().gap(px(1.));
-        if query.is_empty() {
-            let pinned: Vec<&Model> = pinned_ids.iter().filter_map(|id| models.iter().find(|m| m.id == *id)).collect();
-            if !pinned.is_empty() {
-                body = body.child(menu_label("Pinned", p));
-                for (n, model) in pinned.iter().enumerate() {
-                    body = body.child(self.model_row(model, (n < 9).then_some(n + 1), cx));
-                }
-                body = body.child(menu_label("Everything on this server", p));
-            }
-            for model in models.iter().filter(|m| !pinned_ids.contains(&m.id)) {
-                body = body.child(self.model_row(model, None, cx));
-            }
-        } else {
-            let found: Vec<&Model> = models.iter().filter(|m| m.id.to_lowercase().contains(&query)).collect();
-            if found.is_empty() {
-                body = body.child(note("No model matches", p));
-            }
-            for model in found {
-                body = body.child(self.model_row(model, None, cx));
-            }
-        }
-        menu.child(body).child(separator(p)).child(
-            menu_item("server-settings", Some(Icon::Server), url, None, false, p)
-                .child(div().text_size(px(12.5)).text_color(p.text_muted).child("Change"))
+                .justify_center()
+                .size(px(34.))
+                .rounded(px(9.))
+                .cursor_pointer()
+                .hover(move |style| style.bg(p.row_hover))
+                .tooltip(tip("Providers and models"))
+                .child(icon(Icon::Sliders, 17., p.text_faint))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.close(cx);
                     cx.emit(ComposerEvent::OpenModelSettings);
                 })),
+        );
+        let matches =
+            |model: &Model| !searching || model.id.to_lowercase().contains(&query) || model.label().to_lowercase().contains(&query);
+        let mut list = div().id("model-list").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().gap(px(1.));
+        if searching {
+            let mut shown = 0;
+            for source in &sources {
+                let models: Vec<&Model> = source.models.iter().filter(|m| matches(m)).collect();
+                if models.is_empty() {
+                    continue;
+                }
+                list = list.child(self.source_header(source, cx));
+                for model in models {
+                    shown += 1;
+                    list = list.child(self.model_row(source, model, None, cx));
+                }
+            }
+            if shown == 0 {
+                list = list.child(note("No model matches", p));
+            }
+        } else {
+            match &current {
+                Some(ModelTab::Pinned) => {
+                    for (n, (source, model)) in pinned.iter().enumerate() {
+                        list = list.child(self.model_row(source, model, (n < 9).then_some(n + 1), cx));
+                    }
+                }
+                Some(ModelTab::Source(id)) => {
+                    if let Some(source) = sources.iter().find(|s| s.config.id == *id) {
+                        list = list.child(self.source_header(source, cx));
+                        for model in &source.models {
+                            list = list.child(self.model_row(source, model, None, cx));
+                        }
+                        if source.models.is_empty() {
+                            list = list.child(match source.connection {
+                                Connection::Checking => note("Looking for models", p).into_any_element(),
+                                Connection::Online => note("This provider lists no models", p).into_any_element(),
+                                _ => menu_item("setup-provider", Some(Icon::Sliders), "Set up this provider", None, false, p)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.close(cx);
+                                        cx.emit(ComposerEvent::OpenModelSettings);
+                                    }))
+                                    .into_any_element(),
+                            });
+                        }
+                    }
+                }
+                None => list = list.child(note("No providers are turned on", p)),
+            }
+        }
+        let search_row = div().flex().items_center().gap(px(2.)).child(div().flex_1().child(search_box(&self.search, p))).child(
+            div()
+                .id("refresh-models")
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .size(px(30.))
+                .mb(px(4.))
+                .mr(px(2.))
+                .rounded(px(8.))
+                .cursor_pointer()
+                .hover(move |style| style.bg(p.row_hover))
+                .tooltip(tip("Look for models again"))
+                .child(icon(Icon::Refresh, 14., p.text_faint))
+                .on_click(cx.listener(|this, _, _, cx| this.backend.update(cx, |b, cx| b.refresh(cx)))),
+        );
+        menu_panel(p).w(px(390.)).child(
+            div()
+                .flex()
+                .gap(px(6.))
+                .h(px(330.))
+                .child(rail)
+                .child(div().w(px(1.)).flex_shrink_0().my(px(2.)).bg(p.border_soft))
+                .child(div().flex_1().min_w_0().flex().flex_col().child(search_row).child(list)),
         )
     }
 
     fn thinking_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let p = palette(cx);
-        let on = Config::get(cx).thinking;
-        menu_panel(p).w(px(240.)).child(menu_label("Reasoning", p)).children(
-            [
-                (true, "Think it through", "Reason before replying, slower but sharper"),
-                (false, "Reply directly", "Skip the reasoning step"),
-            ]
-            .map(|(value, label, detail)| {
-                menu_item(label, None, label, Some(detail.into()), on == value, p).on_click(cx.listener(move |this, _, _, cx| {
-                    this.backend.update(cx, |b, cx| b.set_thinking(value, cx));
-                    this.close(cx);
+        let models = &Config::get(cx).models;
+        let (on, chosen) = (models.thinking, models.effort);
+        match self.backend.read(cx).control(cx) {
+            Control::Effort(levels) => {
+                let current = chosen.nearest(&levels);
+                menu_panel(p).w(px(270.)).child(menu_label("Effort", p)).children(levels.into_iter().map(|effort| {
+                    menu_item(effort.wire(), None, effort.label(), Some(effort.description().into()), current == Some(effort), p).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.backend.update(cx, |b, cx| b.set_effort(effort, cx));
+                            this.close(cx);
+                        }),
+                    )
                 }))
-            }),
-        )
+            }
+            _ => menu_panel(p).w(px(240.)).child(menu_label("Reasoning", p)).children(
+                [
+                    (true, "Think it through", "Reason before replying, slower but sharper"),
+                    (false, "Reply directly", "Skip the reasoning step"),
+                ]
+                .map(|(value, label, detail)| {
+                    menu_item(label, None, label, Some(detail.into()), on == value, p).on_click(cx.listener(move |this, _, _, cx| {
+                        this.backend.update(cx, |b, cx| b.set_thinking(value, cx));
+                        this.close(cx);
+                    }))
+                }),
+            ),
+        }
     }
 
     fn access_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let p = palette(cx);
-        let current = Config::get(cx).access;
+        let current = Config::get(cx).agent.access;
         menu_panel(p).w(px(360.)).child(menu_label("What the agent may do on its own", p)).children(Access::ALL.map(|access| {
             menu_item(access.label(), Some(access_icon(access)), access.label(), Some(access.description().into()), access == current, p)
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    Config::update(cx, |config| config.access = access);
+                    Config::update(cx, |config| config.agent.access = access);
                     this.close(cx);
                 }))
         }))
@@ -783,7 +990,7 @@ impl Composer {
         let p = palette(cx);
         let isolated = strip.isolated;
         let choosing = strip.can_isolate && !strip.locked;
-        let projects = Config::get(cx).projects.clone();
+        let projects = Config::get(cx).general.projects.clone();
         let current = strip.project.clone();
         let locked = strip.locked;
         let mut menu = menu_panel(p).w(px(360.));
@@ -856,11 +1063,10 @@ impl Composer {
             .px(px(8.))
             .min_w_0()
             .rounded(px(8.))
-            .text_size(px(13.5))
+            .text_size(px(13.))
             .text_color(if open { p.text } else { p.text_muted })
             .cursor_pointer()
-            .when(open, |chip| chip.bg(p.row_active))
-            .hover(move |style| style.bg(p.row_hover).text_color(p.text))
+            .hover(move |style| style.text_color(p.text))
             .on_click(cx.listener(move |this, _, window, cx| this.toggle(menu, window, cx)))
     }
 
@@ -929,18 +1135,98 @@ impl Composer {
             )
     }
 
+    fn question_card(&self, card: &QuestionCard, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let p = palette(cx);
+        let view = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .px(px(14.))
+            .py(px(12.))
+            .rounded(px(16.))
+            .border_1()
+            .border_color(p.accent.opacity(0.4))
+            .bg(p.raised)
+            .shadow_lg()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .size(px(30.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(p.accent_soft)
+                            .child(icon(Icon::Chat, 15., p.accent)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.))
+                            .child(div().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(p.accent).child("Quill is asking"))
+                            .child(div().text_size(px(14.)).text_color(p.text).child(card.question.clone())),
+                    ),
+            )
+            .when(!card.options.is_empty(), |col| {
+                col.child(div().pl(px(42.)).flex().flex_wrap().gap(px(6.)).children(card.options.iter().enumerate().map(
+                    |(index, option)| {
+                        let answer = option.clone();
+                        div()
+                            .id(("question-option", index))
+                            .px(px(12.))
+                            .h(px(30.))
+                            .flex()
+                            .items_center()
+                            .rounded_full()
+                            .border_1()
+                            .border_color(p.border)
+                            .text_size(px(13.))
+                            .text_color(p.text)
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(p.accent_soft).border_color(p.accent.opacity(0.5)))
+                            .child(option.clone())
+                            .on_click(cx.listener(move |_, _, _, cx| cx.emit(ComposerEvent::Answer(answer.clone()))))
+                    },
+                )))
+            })
+            .child(div().pl(px(42.)).text_size(px(12.)).text_color(p.text_faint).child("Or type an answer below and press Enter"));
+        crate::motion::rise("question-card", view, 10., cx)
+    }
+
     fn approval_card(&self, card: &ApprovalCard, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let p = palette(cx);
         let more_open = self.menu == Some(Menu::ApprovalMore);
         let more = more_open.then(|| {
+            let decide = |decision: Decision| {
+                cx.listener(move |this: &mut Self, _: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                    this.close(cx);
+                    cx.emit(ComposerEvent::Decide(decision));
+                })
+            };
+            let similar = card.similar.clone().map(|similar| {
+                menu_item("allow-similar", Some(Icon::Check), format!("Always allow \"{similar}\""), None, false, p)
+                    .on_click(decide(Decision::AllowSimilar))
+            });
+            let tool = (!card.tool.is_empty()).then(|| {
+                menu_item("allow-tool", Some(Icon::Shield), format!("Always allow: {}", card.tool), None, false, p)
+                    .on_click(decide(Decision::AllowTool))
+            });
             let menu = menu_panel(p)
-                .w(px(250.))
-                .child(menu_item("allow-thread", Some(Icon::Bolt), "Allow everything in this thread", None, false, p).on_click(
-                    cx.listener(|this, _, _, cx| {
-                        this.close(cx);
-                        cx.emit(ComposerEvent::Decide(Decision::AlwaysAllow));
-                    }),
-                ))
+                .w(px(280.))
+                .children(similar)
+                .children(tool)
+                .child(
+                    menu_item("allow-thread", Some(Icon::Bolt), "Allow everything in this thread", None, false, p)
+                        .on_click(decide(Decision::AllowAll)),
+                )
                 .child(menu_item("stop-run", Some(Icon::CircleStop), "Stop the agent", None, false, p).on_click(cx.listener(
                     |this, _, _, cx| {
                         this.close(cx);
@@ -949,102 +1235,127 @@ impl Composer {
                 )));
             popup(window, cx, Anchor::BottomRight, menu, |this, cx| this.close(cx))
         });
-        div()
-            .flex()
-            .items_center()
-            .gap(px(12.))
-            .px(px(16.))
-            .py(px(10.))
-            .rounded(px(14.))
-            .border_1()
-            .border_color(p.warning.opacity(0.45))
-            .bg(p.warning.opacity(0.08))
-            .child(icon(Icon::Shield, 17., p.warning))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.))
-                    .child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(p.warning).child(card.title))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .font_family(MONO)
-                                    .text_size(px(13.))
-                                    .text_color(p.text)
-                                    .child(card.target.clone()),
+        let show_diff = self.show_diff && !card.diffs.is_empty();
+        let preview = show_diff.then(|| {
+            div()
+                .id("approval-diff")
+                .max_h(px(260.))
+                .overflow_y_scroll()
+                .rounded(px(10.))
+                .bg(p.sidebar)
+                .border_1()
+                .border_color(p.border_soft)
+                .py(px(6.))
+                .children(card.diffs.iter().map(|diff| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .when(card.diffs.len() > 1, |col| {
+                            col.child(
+                                div().px(px(10.)).font_family(MONO).text_size(px(12.)).text_color(p.text_muted).child(diff.path.clone()),
                             )
-                            .when_some(card.stats, |row, (added, removed)| {
-                                row.child(div().text_size(px(12.)).text_color(p.add).child(format!("+{added}")))
-                                    .child(div().text_size(px(12.)).text_color(p.del).child(format!("-{removed}")))
-                            }),
-                    ),
-            )
+                        })
+                        .child(crate::thread_view::diff_lines(diff, 40, p))
+                }))
+        });
+        let card_view = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .px(px(14.))
+            .py(px(12.))
+            .rounded(px(16.))
+            .border_1()
+            .border_color(p.warning.opacity(0.4))
+            .bg(p.raised)
+            .shadow_lg()
             .child(
                 div()
-                    .id("deny")
-                    .h(px(30.))
-                    .px(px(12.))
                     .flex()
                     .items_center()
-                    .rounded(px(8.))
-                    .border_1()
-                    .border_color(p.border)
-                    .text_size(px(13.))
-                    .text_color(p.text)
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(p.row_hover))
-                    .child("Deny")
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::Decide(Decision::Decline)))),
-            )
-            .child(
-                div()
-                    .id("allow")
-                    .h(px(30.))
-                    .px(px(14.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(8.))
-                    .bg(p.text)
-                    .text_size(px(13.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(p.bg)
-                    .cursor_pointer()
-                    .hover(|style| style.opacity(0.9))
-                    .child("Allow")
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::Decide(Decision::Approve)))),
-            )
-            .child(
-                div()
-                    .relative()
+                    .gap(px(12.))
                     .child(
                         div()
-                            .id("approval-more")
                             .size(px(30.))
+                            .flex_shrink_0()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(8.))
-                            .border_1()
-                            .border_color(p.border)
-                            .cursor_pointer()
-                            .when(more_open, |b| b.bg(p.row_active))
-                            .hover(move |style| style.bg(p.row_hover))
-                            .child(icon(Icon::Dots, 15., p.text_muted))
-                            .on_click(cx.listener(|this, _, window, cx| this.toggle(Menu::ApprovalMore, window, cx))),
+                            .rounded_full()
+                            .bg(p.warning.opacity(0.14))
+                            .child(icon(Icon::Shield, 15., p.warning)),
                     )
-                    .children(more),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.))
+                            .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(card.title.clone()))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .font_family(MONO)
+                                            .text_size(px(12.5))
+                                            .text_color(p.text_muted)
+                                            .child(card.target.clone()),
+                                    )
+                                    .when_some(card.stats, |row, (added, removed)| {
+                                        row.child(div().text_size(px(12.)).text_color(p.add).child(format!("+{added}")))
+                                            .child(div().text_size(px(12.)).text_color(p.del).child(format!("−{removed}")))
+                                    }),
+                            ),
+                    )
+                    .when(!card.diffs.is_empty(), |row| {
+                        row.child(
+                            button("approval-show", if show_diff { "Hide changes" } else { "Show changes" }, Tone::Ghost, p).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.show_diff = !this.show_diff;
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                    }),
             )
+            .children(preview)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().flex_1().text_size(px(12.)).text_color(p.text_faint).child("Enter to allow · Esc to deny"))
+                    .child(
+                        div()
+                            .relative()
+                            .child(
+                                button("approval-more", "Always allow", Tone::Ghost, p)
+                                    .when(more_open, |b| b.bg(p.row_active))
+                                    .child(icon(Icon::ChevronDown, 12., p.text_faint))
+                                    .on_click(cx.listener(|this, _, window, cx| this.toggle(Menu::ApprovalMore, window, cx))),
+                            )
+                            .children(more),
+                    )
+                    .child(
+                        button("deny", "Deny", Tone::Secondary, p)
+                            .child(kbd("Esc", p))
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::Decide(Decision::Decline)))),
+                    )
+                    .child(
+                        button("allow", "Allow", Tone::Primary, p)
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::Decide(Decision::Approve)))),
+                    ),
+            );
+        crate::motion::rise("approval-card", card_view, 10., cx)
     }
 
     fn attachment_chips(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1126,20 +1437,24 @@ pub fn access_icon(access: Access) -> Icon {
     }
 }
 
-fn divider(p: Palette) -> impl IntoElement {
-    div().w(px(1.)).h(px(16.)).mx(px(2.)).bg(p.border)
-}
-
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let empty = self.input.read(cx).value().trim().is_empty() && self.attachments.is_empty();
         let busy = self.busy;
-        let access = Config::get(cx).access;
-        let thinking = self.backend.read(cx).thinking(cx) == Thinking::Toggle;
-        let thinking_on = Config::get(cx).thinking;
+        let access = Config::get(cx).agent.access;
+        let control = self.backend.read(cx).control(cx);
+        let thinking = control != Control::None;
+        let thinking_label = match &control {
+            Control::Effort(levels) => Config::get(cx).models.effort.nearest(levels).map_or("Effort", |e| e.label()),
+            _ if Config::get(cx).models.thinking => "Thinking",
+            _ => "Direct",
+        };
         let (has_model, label) = self.model_label(cx);
-        let window_size = self.backend.read(cx).selected(cx).and_then(|m| m.context);
+        let provider_logo = Backend::selected_ref(cx)
+            .and_then(|model| Config::get(cx).models.provider(&model.provider).map(|provider| provider.kind))
+            .filter(|kind| *kind != ProviderKind::Local);
+        let window_size = Backend::selected_ref(cx).and_then(|model| self.backend.read(cx).effective(&model, cx)).and_then(|m| m.context);
         let menu = self.menu.filter(|m| *m != Menu::ApprovalMore);
         let model_menu = (menu == Some(Menu::Model)).then(|| {
             let content = self.model_menu(cx);
@@ -1169,14 +1484,17 @@ impl Render for Composer {
         let chips = (!self.attachments.is_empty()).then(|| self.attachment_chips(cx));
         let model_chip = self
             .chip("model-chip", Menu::Model, cx)
-            .when(has_model, |chip| chip.child(div().size(px(16.)).flex_shrink_0().child(self.mark.clone())))
-            .when(!has_model, |chip| chip.child(svg().path(Icon::LlamaCpp.path()).size(px(14.)).text_color(p.text_faint)))
+            .when(has_model, |chip| match provider_logo {
+                Some(kind) => chip.child(icon(provider_icon(kind), 15., p.text)),
+                None => chip.child(div().size(px(16.)).flex_shrink_0().child(self.mark.clone())),
+            })
+            .when(!has_model, |chip| chip.child(icon(Icon::Cube, 14., p.text_faint)))
             .child(div().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(label))
             .child(icon(Icon::ChevronDown, 13., p.text_faint));
         let thinking_chip = self
             .chip("thinking-chip", Menu::Thinking, cx)
             .child(icon(Icon::Bulb, 15., p.text_muted))
-            .child(if thinking_on { "Thinking" } else { "Direct" })
+            .child(thinking_label)
             .child(icon(Icon::ChevronDown, 13., p.text_faint));
         let access_chip = self
             .chip("access-chip", Menu::Access, cx)
@@ -1204,21 +1522,30 @@ impl Render for Composer {
             .size(px(34.))
             .rounded_full()
             .map(|send| {
-                if busy {
-                    send.bg(p.danger).cursor_pointer().child(icon(Icon::Stop, 12., gpui_kit::white()))
+                if busy && empty {
+                    send.bg(p.danger).cursor_pointer().hover(|s| s.opacity(0.9)).tooltip(tip("Stop the agent")).child(icon(
+                        Icon::Stop,
+                        12.,
+                        gpui_kit::white(),
+                    ))
                 } else if empty {
                     send.bg(p.fill).child(icon(Icon::ArrowUp, 16., p.text_faint))
                 } else {
-                    send.bg(p.text).cursor_pointer().hover(|s| s.opacity(0.9)).child(icon(Icon::ArrowUp, 16., p.bg))
+                    send.bg(p.accent)
+                        .cursor_pointer()
+                        .hover(|s| s.opacity(0.9))
+                        .tooltip(tip(if busy { "Add this while the agent works" } else { "Send" }))
+                        .child(icon(Icon::ArrowUp, 16., p.accent_text))
                 }
             })
             .on_click(cx.listener(move |this, _, window, cx| {
-                if busy {
+                if busy && empty {
                     cx.emit(ComposerEvent::Stop);
                 } else {
                     this.submit(window, cx);
                 }
             }));
+        let question = self.question.clone().map(|card| self.question_card(&card, cx));
         let strip = self.strip.clone().map(|strip| {
             let open = self.menu == Some(Menu::Workspace);
             let branch_open = self.menu == Some(Menu::Branch);
@@ -1286,28 +1613,32 @@ impl Render for Composer {
                     )
                 })
         });
+        let focused = self.input.read(cx).focus_handle(cx).is_focused(window);
+        let width = f32::from(Config::get(cx).appearance.transcript_width.clamp(560, 1600)) - 56.;
         div()
             .w_full()
-            .max_w(px(760.))
+            .max_w(px(width))
             .flex()
             .flex_col()
             .gap(px(8.))
             .children(approval)
+            .children(question)
             .children(suggestions)
             .child(
                 div()
                     .id("composer-box")
                     .flex()
                     .flex_col()
-                    .gap(px(6.))
+                    .gap(px(8.))
                     .pt(px(12.))
-                    .pb(px(8.))
-                    .px(px(10.))
-                    .rounded(px(18.))
+                    .pb(px(10.))
+                    .px(px(12.))
+                    .rounded(px(20.))
                     .bg(p.composer_bg)
                     .border_1()
-                    .border_color(p.composer_ring)
-                    .hover(move |style| style.border_color(p.composer_ring_hover))
+                    .border_color(if focused { p.accent.opacity(0.55) } else { p.composer_ring })
+                    .shadow_lg()
+                    .hover(move |style| style.border_color(if focused { p.accent.opacity(0.7) } else { p.composer_ring_hover }))
                     .drag_over::<ExternalPaths>(move |style, _, _, _| style.border_color(p.link).bg(p.link.opacity(0.06)))
                     .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| this.add_files(paths.paths().to_vec(), cx)))
                     .children(chips)
@@ -1316,13 +1647,10 @@ impl Render for Composer {
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(2.))
+                            .gap(px(6.))
                             .min_w_0()
                             .child(div().relative().min_w_0().child(model_chip).children(model_menu))
-                            .when(thinking, |row| {
-                                row.child(divider(p)).child(div().relative().child(thinking_chip).children(thinking_menu))
-                            })
-                            .child(divider(p))
+                            .when(thinking, |row| row.child(div().relative().child(thinking_chip).children(thinking_menu)))
                             .child(div().relative().child(access_chip).children(access_menu))
                             .child(div().flex_1())
                             .when(has_model, |row| row.child(context_ring::ring(self.context_used, window_size, p)))

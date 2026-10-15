@@ -4,9 +4,8 @@ use std::process::{Command, Stdio};
 
 use gpui_kit::{Hsla, hsla};
 
-use crate::config::projects_dir;
-use crate::git::{self, hidden};
-use crate::github::{self, Visibility};
+use quill_git::github::{self, Visibility};
+use quill_git::{self as git, hidden};
 
 pub fn name(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
@@ -42,6 +41,23 @@ pub fn open_folder(path: &Path) {
     let _ = Command::new("explorer").arg(path).spawn();
 }
 
+pub fn short_path(path: &Path) -> String {
+    let home = quill_config::home_dir();
+    let shown = match path.strip_prefix(&home) {
+        Ok(rest) if !home.as_os_str().is_empty() => Path::new("~").join(rest),
+        _ => path.to_path_buf(),
+    };
+    let parts: Vec<String> = shown.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    if parts.len() <= 4 {
+        return shown.display().to_string();
+    }
+    format!("{}\\…\\{}", parts[0], parts[parts.len() - 2..].join("\\"))
+}
+
+pub fn open_file(path: &Path) {
+    let _ = hidden("cmd").args(["/C", "start", ""]).arg(path).spawn();
+}
+
 pub fn clean_name(raw: &str) -> String {
     raw.trim()
         .chars()
@@ -56,12 +72,12 @@ pub struct Created {
     pub note: Option<String>,
 }
 
-pub fn create(raw: &str, git_branch: Option<&str>, publish: Option<Visibility>) -> Result<Created, String> {
+pub fn create(base: &Path, raw: &str, git_branch: Option<&str>, publish: Option<Visibility>) -> Result<Created, String> {
     let name = clean_name(raw);
     if name.is_empty() {
         return Err("Give the project a name.".into());
     }
-    let dir = projects_dir().join(&name);
+    let dir = base.join(&name);
     if dir.exists() {
         return Err(format!("{} already exists.", dir.display()));
     }
@@ -82,13 +98,12 @@ pub fn repo_name(url: &str) -> String {
     clean_name(last.trim_end_matches(".git"))
 }
 
-pub fn clone(url: &str) -> Result<PathBuf, String> {
+pub fn clone(base: &Path, url: &str) -> Result<PathBuf, String> {
     let name = repo_name(url);
     if name.is_empty() {
         return Err("That does not look like a Git URL.".into());
     }
-    let base = projects_dir();
-    fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+    fs::create_dir_all(base).map_err(|e| e.to_string())?;
     let mut dir = base.join(&name);
     let mut n = 2;
     while dir.exists() {

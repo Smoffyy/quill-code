@@ -100,10 +100,11 @@ pub enum Command {
     Terminal,
     Commit,
     Init,
+    Compact,
 }
 
 impl Command {
-    pub const ALL: [Command; 9] = [
+    pub const ALL: [Command; 10] = [
         Command::New,
         Command::Init,
         Command::Model,
@@ -113,6 +114,7 @@ impl Command {
         Command::Files,
         Command::Terminal,
         Command::Commit,
+        Command::Compact,
     ];
 
     pub fn name(self) -> &'static str {
@@ -126,6 +128,7 @@ impl Command {
             Command::Terminal => "terminal",
             Command::Commit => "commit",
             Command::Init => "init",
+            Command::Compact => "compact",
         }
     }
 
@@ -140,6 +143,7 @@ impl Command {
             Command::Terminal => "Open a PowerShell terminal in the project",
             Command::Commit => "Commit your work, then push or open a pull request",
             Command::Init => "Have the agent write an AGENTS.md that explains this project",
+            Command::Compact => "Summarise earlier turns to free up the model's context",
         }
     }
 

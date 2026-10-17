@@ -45,13 +45,24 @@ mod tests {
 
     #[test]
     fn paths_cannot_leave_the_project() {
-        let root = PathBuf::from(r"C:\work\proj");
+        let (root, elsewhere, sibling) = if cfg!(windows) {
+            (r"C:\work\proj", r"C:\Windows\System32", r"C:\work\project2\a.txt")
+        } else {
+            ("/work/proj", "/etc", "/work/project2/a.txt")
+        };
+        let root = PathBuf::from(root);
         assert!(resolve(&root, "src/main.rs").is_ok());
         assert!(resolve(&root, "../other").is_err());
-        assert!(resolve(&root, r"C:\Windows\System32").is_err());
+        assert!(resolve(&root, elsewhere).is_err());
+        assert!(resolve(&root, sibling).is_err());
+        assert!(normalize(&root, elsewhere).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_letters_match_case_insensitively() {
+        let root = PathBuf::from(r"C:\work\proj");
         assert!(resolve(&root, r"c:\WORK\proj\a.txt").is_ok());
-        assert!(resolve(&root, r"C:\work\project2\a.txt").is_err());
-        assert!(normalize(&root, r"C:\Windows\win.ini").is_ok());
     }
 
     #[test]

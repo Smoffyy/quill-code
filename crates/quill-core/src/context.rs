@@ -37,6 +37,7 @@ pub fn estimate(history: &[Message]) -> u64 {
         .iter()
         .map(|m| {
             m.content.len()
+                + m.reasoning.as_ref().map_or(0, String::len)
                 + m.images.len() * 3000
                 + m.tool_calls.iter().map(|c| c.function.name.len() + c.function.arguments.len()).sum::<usize>()
         })

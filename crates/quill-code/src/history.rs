@@ -48,25 +48,39 @@ pub fn plan(turn: &Turn) -> Option<(&[PlanStep], Option<&str>)> {
     })
 }
 
-fn explored(tools: &[&ToolItem]) -> String {
-    let count = |names: &[&str]| tools.iter().filter(|t| names.contains(&t.tool.as_str())).count();
-    let (reads, searches, lists) = (count(&["read_file"]), count(&["grep", "find_files"]), count(&["list_dir"]));
-    let other = tools.len() - reads - searches - lists;
-    let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-    let mut parts = Vec::new();
-    if reads > 0 {
-        parts.push(plural(reads, "file", "files"));
+fn explored(tools: &[&ToolItem], working: bool) -> String {
+    let mut kinds: Vec<(&str, usize)> = Vec::new();
+    for tool in tools {
+        let kind = match tool.tool.as_str() {
+            "read_file" => "read",
+            "grep" | "find_files" => "search",
+            "list_dir" => "list",
+            _ if tool.category == Category::Command => "run",
+            _ => "lookup",
+        };
+        match kinds.iter_mut().find(|(name, _)| *name == kind) {
+            Some((_, count)) => *count += 1,
+            None => kinds.push((kind, 1)),
+        }
     }
-    if searches > 0 {
-        parts.push(plural(searches, "search", "searches"));
+    let phrases: Vec<String> = kinds.iter().map(|(kind, count)| phrase(kind, *count, working)).collect();
+    let mut text = phrases.join(", ");
+    if let Some(first) = text.get_mut(..1) {
+        first.make_ascii_uppercase();
     }
-    if lists > 0 {
-        parts.push(plural(lists, "folder", "folders"));
-    }
-    if other > 0 {
-        parts.push(plural(other, "lookup", "lookups"));
-    }
-    parts.join(", ")
+    text
+}
+
+fn phrase(kind: &str, count: usize, working: bool) -> String {
+    let (done, active, one, many) = match kind {
+        "read" => ("read", "reading", "file", "files"),
+        "search" => ("searched for", "searching for", "pattern", "patterns"),
+        "list" => ("listed", "listing", "folder", "folders"),
+        "run" => ("ran", "running", "shell command", "shell commands"),
+        _ => ("looked up", "looking up", "lookup", "lookups"),
+    };
+    let verb = if working { active } else { done };
+    format!("{verb} {count} {}", if count == 1 { one } else { many })
 }
 
 fn seconds_label(seconds: f32) -> String {
@@ -91,13 +105,31 @@ fn command_body(output: &str) -> &str {
 
 fn target(tool: &ToolItem) -> String {
     match tool.target.trim() {
-        "" => return tool.tool.replace('_', " "),
-        "." | "./" => return "the project".into(),
-        _ => {}
+        "" => tool.tool.replace('_', " "),
+        "." | "./" => "the project".into(),
+        text => clean(text).split_whitespace().collect::<Vec<_>>().join(" "),
     }
-    let mut lines = tool.target.lines();
-    let first = clean(lines.next().unwrap_or_default());
-    if lines.next().is_some() { format!("{first} …") } else { first }
+}
+
+fn tool_name(tool: &ToolItem) -> String {
+    match tool.tool.as_str() {
+        "read_file" => "Read".into(),
+        "grep" => "Search".into(),
+        "find_files" => "Find".into(),
+        "list_dir" => "List".into(),
+        "write_file" => "Write".into(),
+        "edit_file" | "apply_patch" => "Update".into(),
+        "shell" => "Shell".into(),
+        "commit_changes" => "Commit".into(),
+        "open_pull_request" => "Pull request".into(),
+        other => {
+            let mut name = other.replace('_', " ");
+            if let Some(first) = name.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            name
+        }
+    }
 }
 
 fn bubble(text: &str, look: Look) -> Vec<Line> {
@@ -121,20 +153,17 @@ pub fn prompt_lines(turn: &Turn, look: Look) -> Vec<Line> {
     lines
 }
 
-pub fn tool_row(tool: &ToolItem, look: Look, spinner: &str) -> Line {
-    let mut head = match tool.status {
+pub fn tool_rows(tool: &ToolItem, look: Look, spinner: &str) -> Vec<Line> {
+    let mark = match tool.status {
         ToolStatus::Running => Line::styled(format!("{spinner} "), accent()),
         ToolStatus::Waiting => Line::styled("! ", warn()),
-        ToolStatus::Failed => Line::styled("✗ ", bad()),
-        ToolStatus::Done if tool.exit_code().is_some_and(|code| code != 0) => Line::styled("✗ ", bad()),
-        ToolStatus::Done => Line::styled("✓ ", good()),
+        ToolStatus::Failed => Line::styled("● ", bad()),
+        ToolStatus::Done if tool.exit_code().is_some_and(|code| code != 0) => Line::styled("● ", bad()),
+        ToolStatus::Done => Line::styled("● ", good()),
     };
-    head.push(format!("{} ", tool.verb()), dim());
+    let mut name = Line::styled(tool_name(tool), bold());
+    name.push(format!("({})", target(tool)), plain());
     let mut tail = Line::default();
-    if !tool.diffs.is_empty() {
-        tail.push(format!(" +{}", tool.diffs.iter().map(|d| d.added).sum::<usize>()), good());
-        tail.push(format!(" -{}", tool.diffs.iter().map(|d| d.removed).sum::<usize>()), bad());
-    }
     if tool.category == Category::Command
         && let Some(code) = tool.exit_code().filter(|code| *code != 0)
     {
@@ -154,10 +183,11 @@ pub fn tool_row(tool: &ToolItem, look: Look, spinner: &str) -> Line {
             }
         }
     }
-    let room = look.width.saturating_sub(head.width() + tail.width()).max(8);
-    head.append(truncate(&Line::plain(target(tool)), room));
-    head.append(tail);
-    truncate(&head, look.width)
+    let mut lines = indent(wrap(&name, look.inner(2)), mark, Line::plain("  "));
+    if let Some(last) = lines.last_mut() {
+        last.append(tail);
+    }
+    lines.into_iter().map(|line| truncate(&line, look.width)).collect()
 }
 
 fn connect(lines: Vec<Line>, look: Look) -> Vec<Line> {
@@ -165,7 +195,7 @@ fn connect(lines: Vec<Line>, look: Look) -> Vec<Line> {
         .into_iter()
         .enumerate()
         .map(|(index, line)| {
-            let mut row = if index == 0 { Line::styled("  ⎿  ", dim()) } else { Line::plain("     ") };
+            let mut row = if index == 0 { Line::styled("  └ ", dim()) } else { Line::plain("    ") };
             row.append(line);
             truncate(&row, look.width)
         })
@@ -194,12 +224,29 @@ fn plural(count: usize, word: &str) -> String {
     if count == 1 { format!("{count} {word}") } else { format!("{count} {word}s") }
 }
 
-fn changed(added: usize, removed: usize) -> String {
-    match (added, removed) {
-        (0, removed) => format!("Removed {}", plural(removed, "line")),
-        (added, 0) => format!("Added {}", plural(added, "line")),
-        (added, removed) => format!("Added {}, removed {}", plural(added, "line"), plural(removed, "line")),
+fn changed(diffs: &[FileDiff]) -> String {
+    let added: usize = diffs.iter().map(|diff| diff.added).sum();
+    let removed: usize = diffs.iter().map(|diff| diff.removed).sum();
+    if let [diff] = diffs
+        && diff.created
+    {
+        return format!("Wrote {} to {}", plural(added, "line"), diff.path);
     }
+    let subject = match diffs {
+        [diff] => diff.path.clone(),
+        _ => format!("{} files", diffs.len()),
+    };
+    let mut parts = Vec::new();
+    if added > 0 {
+        parts.push(plural(added, "addition"));
+    }
+    if removed > 0 {
+        parts.push(plural(removed, "removal"));
+    }
+    if parts.is_empty() {
+        return format!("Updated {subject}");
+    }
+    format!("Updated {subject} with {}", parts.join(" and "))
 }
 
 pub fn diff_lines(diff: &FileDiff, limit: usize, look: Look) -> Vec<Line> {
@@ -236,11 +283,14 @@ pub fn diff_lines(diff: &FileDiff, limit: usize, look: Look) -> Vec<Line> {
     lines
 }
 
+fn explored_output(tool: &ToolItem, output: &str) -> String {
+    let count = output.trim_end().lines().count();
+    if tool.tool == "read_file" { format!("Read {}", plural(count, "line")) } else { format!("Found {}", plural(count, "line")) }
+}
+
 pub fn tool_body(tool: &ToolItem, look: Look) -> Vec<Line> {
     if !tool.diffs.is_empty() {
-        let added: usize = tool.diffs.iter().map(|diff| diff.added).sum();
-        let removed: usize = tool.diffs.iter().map(|diff| diff.removed).sum();
-        let mut lines = connect(vec![Line::styled(changed(added, removed), dim())], look);
+        let mut lines = connect(vec![Line::styled(changed(&tool.diffs), dim())], look);
         for diff in &tool.diffs {
             if tool.diffs.len() > 1 {
                 lines.push(Line::styled(format!("     {}", diff.path), dim()));
@@ -260,33 +310,35 @@ pub fn tool_body(tool: &ToolItem, look: Look) -> Vec<Line> {
             connect(lines, look)
         }
         _ if failed => connect(output_lines(&output, 3, false, bad()), look),
-        Category::Explore | Category::Edit => Vec::new(),
+        Category::Explore => connect(vec![Line::styled(explored_output(tool, &output), dim())], look),
+        Category::Edit => Vec::new(),
         _ => connect(output_lines(&output, 2, false, dim()), look),
     }
 }
 
 pub fn running_command(tool: &ToolItem, look: Look) -> Vec<Line> {
     let output = clean(&tool.output);
-    let body = command_body(&output);
-    let count = body.trim_end().lines().count();
-    let seconds = now_ms().saturating_sub(tool.started) / 1000;
-    let command = clean(tool.target.lines().next().unwrap_or_default());
-    let status = format!(" ({} · {})", duration(seconds), plural(count, "line"));
-    let room = look.width.saturating_sub(7 + status.chars().count()).max(8);
-    let mut first = Line::styled("$ ", dim());
-    first.append(truncate(&Line::plain(command), room));
-    first.push(status, dim());
-    let mut lines = vec![first];
-    lines.extend(output_lines(body, LIVE_OUTPUT, true, dim()));
+    let mut lines = output_lines(command_body(&output), LIVE_OUTPUT, true, dim());
+    if lines.is_empty() {
+        lines.push(Line::styled("Running…", dim()));
+    }
     connect(lines, look)
 }
 
-fn explore_span(items: &[Item], start: usize) -> (usize, usize) {
+fn grouped(tool: &ToolItem) -> bool {
+    match tool.category {
+        Category::Explore => true,
+        Category::Command => tool.status != ToolStatus::Failed && tool.exit_code().is_none_or(|code| code == 0),
+        _ => false,
+    }
+}
+
+fn group_span(items: &[Item], start: usize) -> (usize, usize) {
     let mut end = start;
     for (index, item) in items.iter().enumerate().skip(start) {
         match item {
             Item::Tool(tool) if hidden_tool(tool) => {}
-            Item::Tool(tool) if tool.category == Category::Explore => end = index + 1,
+            Item::Tool(tool) if grouped(tool) => end = index + 1,
             Item::Text(text) | Item::Reasoning(text) if blank(text) => {}
             _ => return (end, index),
         }
@@ -294,28 +346,30 @@ fn explore_span(items: &[Item], start: usize) -> (usize, usize) {
     (end, items.len())
 }
 
-fn explore_tools(items: &[Item]) -> Vec<&ToolItem> {
+fn group_tools(items: &[Item]) -> Vec<&ToolItem> {
     items
         .iter()
         .filter_map(|item| match item {
-            Item::Tool(tool) if !hidden_tool(tool) && tool.category == Category::Explore => Some(tool),
+            Item::Tool(tool) if grouped(tool) => Some(tool),
             _ => None,
         })
         .collect()
 }
 
-pub fn explore_row(tools: &[&ToolItem], look: Look, spinner: &str) -> Line {
-    let working = tools.iter().any(|t| t.working());
-    let failed = tools.iter().filter(|t| t.status == ToolStatus::Failed).count();
-    let mut line = if working { Line::styled(format!("{spinner} "), accent()) } else { Line::styled("✓ ", good()) };
-    line.push(if working { "Exploring " } else { "Explored " }, dim());
-    line.push(explored(tools), plain());
+pub fn group_rows(tools: &[&ToolItem], look: Look, spinner: &str) -> Vec<Line> {
+    let working = tools.iter().any(|tool| tool.working());
+    let failed = tools.iter().filter(|tool| tool.status == ToolStatus::Failed).count();
+    let mut head = if working { Line::styled(format!("{spinner} "), accent()) } else { Line::plain("  ") };
+    head.push(explored(tools, working), dim());
     if failed > 0 {
-        line.push(format!(" ({failed} failed)"), bad());
+        head.push(format!(" ({failed} failed)"), bad());
     }
-    let targets: Vec<String> = tools.iter().map(|tool| target(tool)).collect();
-    line.push(format!(" · {}", targets.join(", ")), dim());
-    truncate(&line, look.width)
+    let mut lines = vec![truncate(&head, look.width)];
+    for tool in tools.iter().filter(|tool| tool.working() && tool.category == Category::Command) {
+        lines.extend(tool_rows(tool, look, spinner));
+        lines.extend(running_command(tool, look));
+    }
+    lines
 }
 
 fn unmarked(line: &str) -> String {
@@ -581,14 +635,14 @@ impl Progress {
                     self.block(&mut out, Kind::Row, reasoning_lines(text, look));
                 }
                 Item::Tool(tool) if hidden_tool(tool) => {}
-                Item::Tool(tool) if look.group && tool.category == Category::Explore => {
-                    let (end, scanned) = explore_span(&turn.items, self.item);
-                    let tools = explore_tools(&turn.items[self.item..end]);
+                Item::Tool(tool) if look.group && grouped(tool) => {
+                    let (end, scanned) = group_span(&turn.items, self.item);
+                    let tools = group_tools(&turn.items[self.item..end]);
                     let closed = scanned < turn.items.len() || !working;
                     if !closed || tools.iter().any(|tool| tool.working()) {
                         break;
                     }
-                    self.block(&mut out, Kind::Row, vec![explore_row(&tools, look, "•")]);
+                    self.block(&mut out, Kind::Row, group_rows(&tools, look, "•"));
                     self.item = end;
                     self.offset = 0;
                     continue;
@@ -597,7 +651,7 @@ impl Progress {
                     if tool.working() {
                         break;
                     }
-                    let mut lines = vec![tool_row(tool, look, "•")];
+                    let mut lines = tool_rows(tool, look, "•");
                     lines.extend(tool_body(tool, look));
                     self.block(&mut out, Kind::Row, lines);
                 }
@@ -668,14 +722,14 @@ impl Progress {
                     }
                 },
                 Item::Tool(tool) if hidden_tool(tool) => {}
-                Item::Tool(tool) if look.group && tool.category == Category::Explore => {
-                    let (end, _) = explore_span(&turn.items, index);
-                    lines.push(explore_row(&explore_tools(&turn.items[index..end]), look, spinner));
+                Item::Tool(tool) if look.group && grouped(tool) => {
+                    let (end, _) = group_span(&turn.items, index);
+                    lines.extend(group_rows(&group_tools(&turn.items[index..end]), look, spinner));
                     index = end;
                     continue;
                 }
                 Item::Tool(tool) => {
-                    lines.push(tool_row(tool, look, spinner));
+                    lines.extend(tool_rows(tool, look, spinner));
                     if tool.status == ToolStatus::Running && tool.category == Category::Command {
                         lines.extend(running_command(tool, look));
                     } else if !tool.working() {
@@ -744,17 +798,27 @@ mod tests {
     fn exploration_groups_wait_for_the_run_to_end() {
         let mut turn = Turn::new("p".into(), Vec::new());
         let mut progress = Progress::new();
-        turn.items.push(tool("1", "read_file", "src/a.rs", ToolStatus::Done));
+        turn.items.push(tool("1", "read_file", "src/a.rs (lines 260-294)", ToolStatus::Done));
         turn.items.push(tool("2", "grep", "TODO", ToolStatus::Running));
         assert!(progress.advance(&turn, look()).is_empty());
-        assert!(texts(&progress.live(&turn, look(), "*", None))[0].starts_with("* Exploring 1 file, 1 search · src/a.rs, TODO"));
+        assert_eq!(texts(&progress.live(&turn, look(), "*", None)), vec!["* Reading 1 file, searching for 1 pattern"]);
         if let Item::Tool(grep) = &mut turn.items[1] {
             grep.status = ToolStatus::Done;
         }
-        assert!(progress.advance(&turn, look()).is_empty());
         turn.items.push(tool("3", "shell", "cargo test", ToolStatus::Running));
-        assert_eq!(texts(&progress.advance(&turn, look())), vec!["", "✓ Explored 1 file, 1 search · src/a.rs, TODO"]);
-        assert_eq!(texts(&progress.live(&turn, look(), "*", None)), vec!["* Running cargo test", "  ⎿  $ cargo test (0s · 0 lines)"]);
+        assert!(progress.advance(&turn, look()).is_empty());
+        let wide = Look { width: 100, ..look() };
+        assert_eq!(
+            texts(&progress.live(&turn, wide, "*", None)),
+            vec!["* Reading 1 file, searching for 1 pattern, running 1 shell command", "* Shell(cargo test)", "  └ Running…"]
+        );
+        if let Item::Tool(shell) = &mut turn.items[2] {
+            shell.status = ToolStatus::Done;
+            shell.output = "Exit code 0".into();
+        }
+        turn.finish(TurnState::Done);
+        let rest = texts(&progress.advance(&turn, look()));
+        assert_eq!(rest[..2], ["".to_string(), "  Read 1 file, searched for 1 pattern, ran 1 shell command".to_string()]);
     }
 
     #[test]
@@ -768,11 +832,25 @@ mod tests {
         turn.items.push(Item::Tool(item));
         turn.finish(TurnState::Done);
         let lines = texts(&Progress::new().advance(&turn, look()));
-        assert_eq!(lines[1], "✓ Wrote a.py +1 -1");
-        assert_eq!(lines[2], "  ⎿  Added 1 line, removed 1 line");
+        assert_eq!(lines[1], "● Write(a.py)");
+        assert_eq!(lines[2], "  └ Updated a.py with 1 addition and 1 removal");
         assert_eq!(lines[3].trim(), "1 - x");
         assert_eq!(lines[4].trim(), "1 + y");
         assert!(lines.iter().any(|line| line == "1 file changed +1 -1"));
+    }
+
+    #[test]
+    fn reads_get_their_own_row_when_grouping_is_off() {
+        let mut turn = Turn::new("p".into(), Vec::new());
+        let mut item = ToolItem::new(legacy("read_file"));
+        item.id = "1".into();
+        item.target = "src/a.rs".into();
+        item.status = ToolStatus::Done;
+        item.output = "one\ntwo\nthree".into();
+        turn.items.push(Item::Tool(item));
+        turn.finish(TurnState::Done);
+        let lines = texts(&Progress::new().advance(&turn, Look { group: false, ..look() }));
+        assert_eq!(lines[1..3], ["● Read(src/a.rs)".to_string(), "  └ Read 3 lines".to_string()]);
     }
 
     #[test]
@@ -786,8 +864,8 @@ mod tests {
         turn.items.push(Item::Tool(item));
         turn.finish(TurnState::Done);
         let lines = texts(&Progress::new().advance(&turn, look()));
-        assert_eq!(lines[1], "✗ Ran cargo test · exit 101");
-        assert_eq!(lines[2..4], ["  ⎿  error: one".to_string(), "     error: two".to_string()]);
+        assert_eq!(lines[1], "● Shell(cargo test) · exit 101");
+        assert_eq!(lines[2..4], ["  └ error: one".to_string(), "    error: two".to_string()]);
     }
 
     #[test]

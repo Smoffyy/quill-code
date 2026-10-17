@@ -15,6 +15,8 @@ const REFUSED: &str = "The model declined to continue with this request. Try rep
 
 const MAX_COMPACTIONS: usize = 3;
 
+const MALFORMED_RETRIES: usize = 2;
+
 const UNASKED_GIT: &str = "The user has not asked for a commit or a pull request, so leave the changes uncommitted and finish with your reply. The user commits when they choose to.";
 
 const CRAMPED: &str = "The context filled up three times in this turn, so Quill stopped compacting it. The task may need a model with a bigger context window, or smaller steps.";
@@ -82,6 +84,7 @@ pub(crate) fn run(
     session.asked_for_git = tools::asks_for_git(&input.text);
     session.push(Message::user_with_images(input.text, input.images));
     let mut retried = false;
+    let mut malformed = 0;
     let mut floor = 0;
     let mut compactions = 0;
     let mut warned = false;
@@ -103,6 +106,10 @@ pub(crate) fn run(
         }
         let reply = match step(session, turn, ctx, provider, &system, &specs, cancel) {
             Ok(reply) => reply,
+            Err(error) if malformed < MALFORMED_RETRIES && malformed_output(&error.0) => {
+                malformed += 1;
+                continue;
+            }
             Err(error) => {
                 let again = !retried && ctx.limits.auto_compact && compactions < MAX_COMPACTIONS && context::overflowed(&error.0);
                 if !again || !compact(session, ctx, cancel) {
@@ -114,17 +121,20 @@ pub(crate) fn run(
             }
         };
         retried = false;
+        malformed = 0;
         if cancel.load(Ordering::Relaxed) {
-            if !reply.text.trim().is_empty() {
-                session.push(Message::assistant(reply.text, Vec::new()));
+            if !reply.text.trim().is_empty() || !reply.reasoning.trim().is_empty() {
+                session.push(Message::assistant(reply.text, Vec::new()).with_reasoning(reply.reasoning));
             }
             return Outcome::Stopped;
         }
         let truncated = reply.stop == Some(StopReason::MaxTokens);
         let refused = reply.stop == Some(StopReason::Refusal);
         let calls = if truncated || refused { Vec::new() } else { reply.calls };
-        let content = if calls.is_empty() && reply.text.trim().is_empty() { reply.reasoning.trim().to_string() } else { reply.text };
-        session.push(Message::assistant(content, calls.clone()));
+        let answer_is_reasoning = calls.is_empty() && reply.text.trim().is_empty();
+        let content = if answer_is_reasoning { reply.reasoning.trim().to_string() } else { reply.text };
+        let thinking = if answer_is_reasoning { String::new() } else { reply.reasoning };
+        session.push(Message::assistant(content, calls.clone()).with_reasoning(thinking));
         if calls.is_empty() {
             if session.take_steers() {
                 continue;
@@ -169,6 +179,10 @@ fn make_room(session: &mut Session, ctx: &TurnContext, cancel: &AtomicBool, over
         session.measured = measured;
     }
     compact(session, ctx, cancel)
+}
+
+fn malformed_output(error: &str) -> bool {
+    error.contains("peg-native") || error.contains("Failed to parse input")
 }
 
 fn step(
@@ -522,6 +536,31 @@ mod tests {
         assert!(!root.join("b.txt").exists());
         let second = &script.seen.lock().unwrap()[1];
         assert!(second.messages.last().unwrap().content.contains("declined"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parser_failures_are_the_ones_retried() {
+        assert!(malformed_output("The model produced output that does not match the expected peg-native format"));
+        assert!(malformed_output("Failed to parse input at pos 12"));
+        assert!(!malformed_output("The server answered 500"));
+    }
+
+    #[test]
+    fn reasoning_stays_in_the_history_for_the_next_step() {
+        let root = temp("reasoning-history");
+        let plan = call("c1", "update_plan", r#"{"plan":[{"step":"Write it","status":"in_progress"}]}"#);
+        let script = Script::new(vec![
+            vec![Stream::Reasoning("Plan the parser first.".into()), plan, Stream::Stop(StopReason::ToolUse)],
+            vec![Stream::Content("Done.".into())],
+        ]);
+        let (handle, rx) = start(&root);
+        let input = Input { text: "write the parser".into(), images: Vec::new() };
+        handle.send(Op::Turn { turn: 0, input, context: context(script.clone(), &root, Access::Full), cancel: Arc::default() });
+        assert_eq!(until_finished(&rx, |_| {}), Outcome::Done);
+        let seen = script.seen.lock().unwrap();
+        let assistant = seen[1].messages.iter().find(|m| m.role == quill_providers::Role::Assistant).unwrap();
+        assert_eq!(assistant.reasoning.as_deref(), Some("Plan the parser first."));
         let _ = std::fs::remove_dir_all(&root);
     }
 

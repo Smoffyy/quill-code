@@ -282,20 +282,30 @@ impl Tool for ReadFile {
     }
 
     fn target(&self, args: &Value) -> String {
-        args::text(args, &PATH).unwrap_or_default().trim().replace('\\', "/")
+        let path = args::text(args, &PATH).unwrap_or_default().trim().replace('\\', "/");
+        match span(args) {
+            (1, None) => path,
+            (start, None) => format!("{path} (from line {start})"),
+            (start, Some(end)) => format!("{path} (lines {start}-{end})"),
+        }
     }
 
     fn prepare(&self, args: &Value, ctx: &Ctx<'_>) -> Result<Prepared, String> {
         args::trimmed(args, &PATH).ok_or("read_file needs a \"path\".")?;
         let (path, effect) = locate(ctx.root, args)?;
-        let start = args::number(args, &["start_line", "offset", "start", "from", "line"]).unwrap_or(1).max(1) as usize;
-        let end = args::number(args, &["end_line", "end", "to"])
-            .map(|end| end as usize)
-            .or_else(|| args::number(args, &["limit", "lines", "count"]).map(|n| start + n as usize - 1));
+        let (start, end) = span(args);
         let root = ctx.root.to_path_buf();
         let shown = path.clone();
         Ok(reading(effect, &shown, Box::new(move |ctx: &Ctx<'_>| Output::settle(read(&root, &path, start, end, ctx.limits)))))
     }
+}
+
+fn span(args: &Value) -> (usize, Option<usize>) {
+    let start = args::number(args, &["start_line", "offset", "start", "from", "line"]).unwrap_or(1).max(1) as usize;
+    let end = args::number(args, &["end_line", "end", "to"])
+        .map(|end| end as usize)
+        .or_else(|| args::number(args, &["limit", "lines", "count"]).map(|n| start + n as usize - 1));
+    (start, end)
 }
 
 fn read(root: &Path, path: &Path, start: usize, end: Option<usize>, limits: &Limits) -> Result<String, String> {
@@ -685,6 +695,14 @@ mod tests {
         let text = run(&ReadFile, &root, json!({ "path": "a.txt" })).unwrap().text;
         assert!(text.lines().nth(1) == Some("    2"), "{text:?}");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn read_targets_name_the_lines_asked_for() {
+        assert_eq!(ReadFile.target(&json!({ "path": "src\\a.rs" })), "src/a.rs");
+        assert_eq!(ReadFile.target(&json!({ "path": "a.rs", "start_line": 260, "end_line": 294 })), "a.rs (lines 260-294)");
+        assert_eq!(ReadFile.target(&json!({ "path": "a.rs", "start_line": 260 })), "a.rs (from line 260)");
+        assert_eq!(ReadFile.target(&json!({ "path": "a.rs", "offset": 5, "limit": 3 })), "a.rs (lines 5-7)");
     }
 
     #[test]

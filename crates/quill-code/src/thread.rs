@@ -130,16 +130,6 @@ impl ToolItem {
     pub fn exit_code(&self) -> Option<i32> {
         self.output.lines().next()?.strip_prefix("Exit code ")?.trim().parse().ok()
     }
-
-    pub fn verb(&self) -> &str {
-        if self.working() {
-            &self.active
-        } else if self.diffs.len() == 1 && self.diffs[0].created {
-            "Created"
-        } else {
-            &self.done
-        }
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]

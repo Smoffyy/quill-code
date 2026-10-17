@@ -35,7 +35,7 @@ crates/
                   services with a Bearer key and reasoning_effort
     anthropic.rs  the Messages API over raw HTTP: Models API, adaptive thinking with effort, tool use with eager input
                   streaming, prompt caching, refusal fallbacks, server-side compaction, native content replay
-    message.rs    chat messages with images and tool calls, stored in OpenAI shape plus the provider's native content
+    message.rs    chat messages with images, tool calls and reasoning (sent as reasoning_content, kept in the saved history), stored in OpenAI shape plus the provider's native content
   quill-core/    the agent engine, no UI
     protocol.rs   Event (serde, tagged) and the shared types: ToolView, Approval, Decision, PlanStep, Outcome
     session.rs    one thread per session: Op queue (Turn, Steer, Decide, Answer, Compact, Shutdown), inbox, history; the Engine
@@ -65,7 +65,7 @@ crates/
                   pickers, approval and question cards, status line, the event loop
     term.rs       raw mode, the inline renderer (Layout::frame rewrites the live area in place under the scrollback), the
                   input thread with paste detection, hidden key input
-    history.rs    turns as styled lines: prompt, tool rows with timings, grouped exploring, diffs, command output, plan,
+    history.rs    turns as styled lines: prompt, tool rows with timings, grouped reads, searches and commands, diffs, command output, plan,
                   questions, reasoning, the ending; Progress prints each piece once it settles and previews the rest live
     markdown.rs   markdown to wrapped lines: headings, lists, quotes, code blocks, tables, links
     text.rs       styled spans and lines, word and character wrapping, truncation, cleaning terminal noise from output
@@ -90,7 +90,7 @@ assets/  brand/ (weave icons)
 
 ## How a turn runs
 
-Each thread gets a `quill_core` session the first time it sends, started with the thread's history; the screen keeps one session at a time and shuts it down when another thread is opened. `Workspace::send` builds a `TurnContext` (engine, model, summariser, thinking or effort, output limit, server compaction, context window, workdir, access, toolsets, personal instructions, limits, rules) and sends `Op::Turn` with a fresh cancel flag. A prompt sent while the selected provider is still being probed waits until the probe answers. The session owns the history: it pushes every message itself and reports it with `Event::Message`, which the workspace mirrors into the thread for saving. Events come back through the `Msg` channel and `Workspace::apply` turns them into `Item`s; every turn event carries its turn index, so a stopped run can never write into a newer turn. `history::Progress` then prints each item into the scrollback once it settles: a tool when it ends, text paragraph by paragraph (never inside an open code fence), a run of exploring when it is over, and finally the outcome, the changed files and a footer. Whatever has not settled is drawn in the live area.
+Each thread gets a `quill_core` session the first time it sends, started with the thread's history; the screen keeps one session at a time and shuts it down when another thread is opened. `Workspace::send` builds a `TurnContext` (engine, model, summariser, thinking or effort, output limit, server compaction, context window, workdir, access, toolsets, personal instructions, limits, rules) and sends `Op::Turn` with a fresh cancel flag. A prompt sent while the selected provider is still being probed waits until the probe answers. The session owns the history: it pushes every message itself and reports it with `Event::Message`, which the workspace mirrors into the thread for saving. Events come back through the `Msg` channel and `Workspace::apply` turns them into `Item`s; every turn event carries its turn index, so a stopped run can never write into a newer turn. `history::Progress` then prints each item into the scrollback once it settles: a tool when it ends, text paragraph by paragraph (never inside an open code fence), a run of reads, searches and commands when it is over, and finally the outcome, the changed files and a footer. Whatever has not settled is drawn in the live area.
 
 Messages typed while a run is going become `Op::Steer` and are added before the next step. A tool is prepared first (so edits have their diff), then the policy decides; anything that needs the user emits `ApprovalRequested` and waits for `Op::Decide`, and `ask_user` waits for `Op::Answer`. Stop (Esc, or Ctrl+C) sets the cancel flag; a running command is killed with everything it started, and the engine answers every open tool call, because llama.cpp templates reject dangling tool calls. A new turn sent while a stopped one is still winding down queues behind it. When the window fills past the compaction threshold, earlier turns are summarised and old tool output is trimmed; `/compact` does it on demand and says why when there is nothing to compact (`Event::CompactFailed`). Threads are saved when a turn starts and finishes; a turn still running at shutdown is marked Stopped on load.
 
@@ -123,7 +123,7 @@ The last line of the live area shows the model, its reasoning setting, the acces
 ## Look and feel
 
 - Colours come from the terminal's own palette, so the screen follows any light or dark theme: `text::accent`, `good`, `bad` and `warn` are the dark ANSI cyan, green, red and yellow, plus `dim` and `bold`. Never hard-code RGB.
-- Prompts start with `›`, settled tool rows with a green `•` or a red `✗`, running ones with a braille spinner; list selections are marked `▸` and the current choice `✓`. Diffs show one line number with additions in green and removals in red. Notices start with `·`, problems with `!`.
+- Prompts start with `›`. Tool rows look like Claude Code's: a `●` (green when done, red when failed, a braille spinner while running) before `Name(target)` with the whole target wrapped, and the result hangs under `└`. A run of finished reads, searches and shell commands collapses into one dim summary line. List selections are marked `▸` and the current choice `✓`. Diffs show one line number with additions in green and removals in red. Notices start with `·`, problems with `!`.
 - A dim rule separates the scrollback from the prompt; the status line sits at the bottom.
 - The weave is drawn live from `quill-weave` as braille on the welcome banner and stays monochrome; `quill-weave` is pinned by tests to exact reference frames.
 - Keys: Enter sends (and steers while Quill works), Shift+Enter, Alt+Enter or Ctrl+J add a line, Esc stops or closes, Ctrl+C clears, stops, or quits when pressed twice, Ctrl+D quits on an empty prompt, Tab takes a suggestion, Alt+V attaches an image from the clipboard.

@@ -96,6 +96,9 @@ fn model(name: String, details: Option<&Value>, running: &Value) -> Option<Model
 
 fn wire(message: &Message, names: &HashMap<&str, &str>) -> Value {
     let mut value = json!({ "role": message.role, "content": message.content });
+    if let Some(reasoning) = &message.reasoning {
+        value["thinking"] = json!(reasoning);
+    }
     if !message.images.is_empty() {
         let images: Vec<&str> = message.images.iter().map(|url| url.split_once("base64,").map_or(url.as_str(), |(_, data)| data)).collect();
         value["images"] = json!(images);
@@ -209,7 +212,7 @@ mod tests {
             model: "qwen3:8b".into(),
             messages: vec![
                 Message::user_with_images("look", vec!["data:image/png;base64,AAAA".into()]),
-                Message::assistant("", vec![ToolCall::new("c1", "shell", r#"{"command":"ls"}"#)]),
+                Message::assistant("", vec![ToolCall::new("c1", "shell", r#"{"command":"ls"}"#)]).with_reasoning("Checking the listing."),
                 Message::tool("c1", "a.txt"),
             ],
             reasoning: Some(Reasoning::Toggle { kwarg: "enable_thinking".into(), on: false }),
@@ -224,6 +227,7 @@ mod tests {
         assert_eq!(chat_body(&effort)["think"], "high");
         assert_eq!(body["messages"][0]["images"][0], "AAAA");
         assert_eq!(body["messages"][1]["tool_calls"][0]["function"]["arguments"]["command"], "ls");
+        assert_eq!(body["messages"][1]["thinking"], "Checking the listing.");
         assert_eq!(body["messages"][2]["tool_name"], "shell");
         assert_eq!(body["tools"][0]["function"]["name"], "shell");
     }

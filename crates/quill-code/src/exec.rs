@@ -115,9 +115,10 @@ impl Printer {
                     }
                     if !matches!(tool.category, quill_core::Category::Plan | quill_core::Category::Question) {
                         self.close_text();
-                        self.err(&history::tool_row(tool, self.look(), "•"));
-                        for line in history::tool_body(tool, self.look()) {
-                            self.err(&line);
+                        let mut lines = history::tool_rows(tool, self.look(), "•");
+                        lines.extend(history::tool_body(tool, self.look()));
+                        for line in &lines {
+                            self.err(line);
                         }
                     }
                 }

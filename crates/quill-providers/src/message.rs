@@ -38,6 +38,7 @@ pub struct Message {
     pub images: Vec<String>,
     pub tool_calls: Vec<ToolCall>,
     pub tool_call_id: Option<String>,
+    pub reasoning: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -49,6 +50,8 @@ struct RawMessage {
     tool_calls: Vec<ToolCall>,
     #[serde(default)]
     tool_call_id: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 impl From<RawMessage> for Message {
@@ -62,7 +65,8 @@ impl From<RawMessage> for Message {
             }
             _ => (String::new(), Vec::new()),
         };
-        Message { role: raw.role, content, images, tool_calls: raw.tool_calls, tool_call_id: raw.tool_call_id }
+        let reasoning = raw.reasoning_content.filter(|text| !text.trim().is_empty());
+        Message { role: raw.role, content, images, tool_calls: raw.tool_calls, tool_call_id: raw.tool_call_id, reasoning }
     }
 }
 
@@ -74,7 +78,7 @@ impl Serialize for Message {
 
 impl Message {
     fn new(role: Role, content: impl Into<String>) -> Message {
-        Message { role, content: content.into(), images: Vec::new(), tool_calls: Vec::new(), tool_call_id: None }
+        Message { role, content: content.into(), images: Vec::new(), tool_calls: Vec::new(), tool_call_id: None, reasoning: None }
     }
 
     pub fn system(content: impl Into<String>) -> Message {
@@ -93,6 +97,11 @@ impl Message {
         Message { tool_calls, ..Message::new(Role::Assistant, content) }
     }
 
+    pub fn with_reasoning(self, reasoning: impl Into<String>) -> Message {
+        let reasoning = reasoning.into();
+        Message { reasoning: (!reasoning.trim().is_empty()).then_some(reasoning), ..self }
+    }
+
     pub fn tool(id: impl Into<String>, content: impl Into<String>) -> Message {
         Message { tool_call_id: Some(id.into()), ..Message::new(Role::Tool, content) }
     }
@@ -106,6 +115,9 @@ impl Message {
             parts.extend(self.images.iter().map(|url| json!({ "type": "image_url", "image_url": { "url": url } })));
             json!(parts)
         };
+        if let Some(reasoning) = &self.reasoning {
+            value["reasoning_content"] = json!(reasoning);
+        }
         if !self.tool_calls.is_empty() {
             value["tool_calls"] = json!(self.tool_calls);
         }
@@ -141,5 +153,15 @@ mod tests {
         assert_eq!(result["role"], "tool");
         assert_eq!(result["tool_call_id"], "c1");
         assert!(serde_json::to_value(Message::user("x")).unwrap().get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn reasoning_round_trips_through_the_saved_history() {
+        let message = Message::assistant("", Vec::new()).with_reasoning("Check the listing first.");
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(value["reasoning_content"], "Check the listing first.");
+        let back: Message = serde_json::from_value(value).unwrap();
+        assert_eq!(back, message);
+        assert!(serde_json::to_value(Message::user("x")).unwrap().get("reasoning_content").is_none());
     }
 }

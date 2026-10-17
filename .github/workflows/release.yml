@@ -3,7 +3,6 @@ name: Release
 on:
   push:
     branches: [main]
-    paths: [Cargo.toml, CHANGELOG.md]
   workflow_dispatch:
 
 concurrency:
@@ -19,7 +18,6 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       release: ${{ steps.version.outputs.release }}
-      title: ${{ steps.changelog.outputs.title }}
       notes: ${{ steps.changelog.outputs.notes }}
     steps:
       - uses: actions/checkout@v4
@@ -29,8 +27,9 @@ jobs:
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "quill-code") | .version')
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if gh release list --limit 1000 --json tagName --jq '.[].tagName' | grep -Fqx "v$version"; then
-            echo "v$version already has a release"
+          state=$(gh release list --limit 1000 --json tagName,isDraft --jq ".[] | select(.tagName == \"v$version\") | if .isDraft then \"draft\" else \"published\" end")
+          if [ "$state" = "published" ]; then
+            echo "v$version is already published. Bump the version in Cargo.toml to make a new release."
             echo "release=false" >> "$GITHUB_OUTPUT"
           else
             echo "release=true" >> "$GITHUB_OUTPUT"
@@ -40,15 +39,13 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          title=$(awk -v v="$VERSION" '$1 == "##" && $2 == v { print substr($0, 4); exit }' CHANGELOG.md)
-          if [ -z "$title" ]; then
-            echo "::error file=CHANGELOG.md::No '## $VERSION' section in CHANGELOG.md"
+          if ! awk -v v="[$VERSION]" '$1 == "##" && $2 == v && $3 == "-" && $4 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ { found = 1 } END { exit !found }' CHANGELOG.md; then
+            echo "::error file=CHANGELOG.md::No '## [$VERSION] - YYYY-MM-DD' section in CHANGELOG.md"
             exit 1
           fi
-          echo "title=$title" >> "$GITHUB_OUTPUT"
           {
             echo "notes<<EOF_NOTES"
-            awk -v v="$VERSION" '$1 == "##" { if (found) exit; found = $2 == v; next } found' CHANGELOG.md
+            awk -v v="[$VERSION]" '/^\[[^]]+\]: / { exit } $1 == "##" { if (found) exit; found = $2 == v; next } found' CHANGELOG.md
             echo "EOF_NOTES"
           } >> "$GITHUB_OUTPUT"
 
@@ -56,17 +53,20 @@ jobs:
     needs: prepare
     if: needs.prepare.outputs.release == 'true'
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: macos-latest
             target: x86_64-apple-darwin
+            cross: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -76,32 +76,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libfontconfig-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build -p quill-code --release --locked --target ${{ matrix.target }}
       - shell: bash
-        env:
-          NAME: quill-code-${{ needs.prepare.outputs.version }}-${{ matrix.target }}
         run: |
-          mkdir "$NAME"
-          cp LICENSE README.md assets/fonts/OFL.txt "$NAME"
-          if [ "$RUNNER_OS" = Windows ]; then
-            cp target/${{ matrix.target }}/release/quill-code.exe "$NAME"
-            7z a -tzip "$NAME.zip" "$NAME"
-          else
-            cp target/${{ matrix.target }}/release/quill-code "$NAME"
-            tar czf "$NAME.tar.gz" "$NAME"
-          fi
+          binary="target/${{ matrix.target }}/release/quill"
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          if [ "${{ matrix.cross }}" != "true" ]; then "$binary" --version; fi
+          sh scripts/package.sh ${{ matrix.target }} "$binary" dist
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: quill-code-*.*
+          path: dist/*
           if-no-files-found: error
 
   release:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -109,8 +103,22 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
           TAG: v${{ needs.prepare.outputs.version }}
-          TITLE: ${{ needs.prepare.outputs.title }}
           NOTES: ${{ needs.prepare.outputs.notes }}
         run: |
-          printf '%s\n' "$NOTES" > notes.md
-          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" --title "$TITLE" --notes-file notes.md
+          cp install.sh install.ps1 dist/
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          rm *.sha256
+          sha256sum install.sh install.ps1 >> SHA256SUMS
+          {
+            printf '%s\n\n' "$NOTES"
+            printf '## Install\n\n'
+            printf 'macOS and Linux:\n\n```\ncurl -fsSL https://github.com/%s/releases/latest/download/install.sh | sh\n```\n\n' "$GITHUB_REPOSITORY"
+            printf 'Windows (PowerShell):\n\n```\nirm https://github.com/%s/releases/latest/download/install.ps1 | iex\n```\n\n' "$GITHUB_REPOSITORY"
+            printf 'Already installed? Run `quill update`, or `quill update <version>` to switch to another release.\n'
+          } > ../notes.md
+          for id in $(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id"); do
+            echo "Replacing the earlier draft of $TAG"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
+          done
+          gh release create "$TAG" * --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Quill Code $TAG" --notes-file ../notes.md --draft

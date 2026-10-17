@@ -27,6 +27,14 @@ pub enum PullState {
     Closed,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Release {
+    pub version: String,
+    pub title: String,
+    pub date: String,
+    pub prerelease: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PullRequest {
     pub number: u64,
@@ -58,7 +66,7 @@ fn token(credential: &str) -> Option<&str> {
 
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
-        .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).root_certs(RootCerts::PlatformVerifier).build())
+        .tls_config(TlsConfig::builder().provider(TlsProvider::Rustls).root_certs(RootCerts::PlatformVerifier).build())
         .timeout_global(Some(Duration::from_secs(30)))
         .http_status_as_error(false)
         .build()
@@ -121,6 +129,34 @@ fn parse_pull(pull: &Value) -> Option<PullRequest> {
     Some(PullRequest { number, state })
 }
 
+pub fn releases(slug: &str) -> Result<Vec<Release>, String> {
+    let mut response = agent()
+        .get(format!("https://api.github.com/repos/{slug}/releases"))
+        .query("per_page", "100")
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "quill-code")
+        .call()
+        .map_err(|e| format!("Could not reach GitHub: {e}"))?;
+    let status = response.status().as_u16();
+    let body: Value = response.body_mut().read_json().unwrap_or_default();
+    if status != 200 {
+        return Err(api_error(&body));
+    }
+    Ok(body.as_array().into_iter().flatten().filter_map(parse_release).collect())
+}
+
+fn parse_release(release: &Value) -> Option<Release> {
+    if release["draft"] == true {
+        return None;
+    }
+    Some(Release {
+        version: release["tag_name"].as_str()?.trim_start_matches('v').to_string(),
+        title: release["name"].as_str().unwrap_or_default().to_string(),
+        date: release["published_at"].as_str().unwrap_or_default().chars().take(10).collect(),
+        prerelease: release["prerelease"] == true,
+    })
+}
+
 pub fn pull_request(slug: &str, branch: &str) -> Option<PullRequest> {
     let owner = slug.split('/').next()?;
     let mut request = agent()
@@ -152,6 +188,15 @@ mod tests {
         assert_eq!(api_error(&taken), "GitHub said: name already exists on this account");
         assert_eq!(api_error(&json!({ "message": "Bad credentials" })), "GitHub said: Bad credentials");
         assert_eq!(api_error(&Value::Null), "GitHub said: the request failed");
+    }
+
+    #[test]
+    fn releases_skip_drafts() {
+        let published = json!({ "tag_name": "v1.0.0", "name": "Quill Code v1.0.0", "published_at": "2026-10-16T09:00:00Z", "draft": false, "prerelease": false });
+        let draft = json!({ "tag_name": "v1.1.0", "name": "", "published_at": null, "draft": true });
+        let release = parse_release(&published).unwrap();
+        assert_eq!((release.version.as_str(), release.date.as_str(), release.prerelease), ("1.0.0", "2026-10-16", false));
+        assert!(parse_release(&draft).is_none());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 mod args;
+mod editorconfig;
 mod fs;
 mod git;
-mod patch;
 mod paths;
 mod plan;
 mod shell;
@@ -15,10 +15,10 @@ use serde_json::Value;
 use crate::diff::FileDiff;
 use crate::options::{Limits, Toolsets};
 use crate::policy::Effect;
-use crate::protocol::{Approval, Category, PlanStep, ToolView};
+use crate::protocol::{Approval, Category, PlanStep, Question, ToolView};
 
 pub use args::{invalid, parse as parse_args};
-pub(crate) use shell::{hide_window, similar};
+pub use git::asks_for_git;
 pub use shell::{run as run_command, shell_command};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +44,7 @@ pub struct Spec {
 pub trait Host: Sync {
     fn output(&self, chunk: &str);
     fn plan(&self, steps: Vec<PlanStep>, explanation: Option<String>);
-    fn ask(&self, question: &str, options: &[String]) -> Option<String>;
+    fn ask(&self, questions: &[Question]) -> Option<Vec<String>>;
 }
 
 pub struct Ctx<'a> {
@@ -113,13 +113,11 @@ pub trait Tool: Send + Sync {
 
 pub fn all() -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(fs::ListDir),
         Box::new(fs::FindFiles),
         Box::new(fs::Grep),
         Box::new(fs::ReadFile),
         Box::new(fs::WriteFile),
         Box::new(fs::EditFile),
-        Box::new(patch::ApplyPatch),
         Box::new(shell::ShellTool),
         Box::new(plan::UpdatePlan),
         Box::new(plan::AskUser),
@@ -187,6 +185,23 @@ pub fn title(name: &str) -> String {
     all().iter().find(|tool| tool.spec().name == name).map_or_else(|| name.replace('_', " "), |tool| tool.spec().title.to_string())
 }
 
+pub(crate) fn file_of(name: &str, arguments: &str) -> Option<(String, bool)> {
+    let tools = all();
+    let spec = find(&tools, name)?.spec();
+    let changed = match spec.category {
+        Category::Edit => true,
+        _ if spec.name == "read_file" => false,
+        _ => return None,
+    };
+    let path = args::trimmed(&args::parse(arguments), &args::PATH)?.replace('\\', "/");
+    Some((path, changed))
+}
+
+pub(crate) fn plan_of(name: &str, arguments: &str) -> Option<Vec<PlanStep>> {
+    let tools = all();
+    (find(&tools, name)?.spec().name == "update_plan").then(|| plan::steps(&args::parse(arguments)))
+}
+
 pub fn names(tools: &[Box<dyn Tool>]) -> String {
     tools.iter().map(|tool| tool.spec().name).collect::<Vec<_>>().join(", ")
 }
@@ -203,11 +218,24 @@ pub fn legacy(kind: &str) -> ToolView {
         "PullRequest" => "open_pull_request",
         other => other,
     };
+    if let Some((tool, category, active, done)) = RETIRED.iter().find(|(tool, ..)| *tool == name) {
+        return ToolView {
+            id: String::new(),
+            tool: tool.to_string(),
+            category: *category,
+            active: active.to_string(),
+            done: done.to_string(),
+            target: String::new(),
+        };
+    }
     match all().iter().find(|tool| tool.spec().name == name) {
         Some(tool) => view(tool.as_ref(), "", &Value::Null),
         None => unknown_view("", name),
     }
 }
+
+const RETIRED: [(&str, Category, &str, &str); 2] =
+    [("list_dir", Category::Explore, "Looking through", "Looked through"), ("apply_patch", Category::Edit, "Patching", "Patched")];
 
 #[cfg(test)]
 mod tests {
@@ -247,6 +275,8 @@ mod tests {
     fn old_tool_kinds_map_to_new_tools() {
         assert_eq!(legacy("Run").tool, "shell");
         assert_eq!(legacy("Search").category, Category::Explore);
+        assert_eq!(legacy("List").category, Category::Explore);
+        assert_eq!(legacy("apply_patch").category, Category::Edit);
         assert_eq!(legacy("Mystery").category, Category::Other);
     }
 }

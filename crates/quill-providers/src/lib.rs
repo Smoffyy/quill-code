@@ -1,15 +1,19 @@
-mod anthropic;
+mod lmstudio;
 mod message;
+mod ollama;
 mod openai;
+mod profiles;
 
 use std::sync::atomic::AtomicBool;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
-pub use anthropic::{ANTHROPIC_URL, Anthropic, image_block};
+pub use lmstudio::LmStudio;
 pub use message::{FunctionCall, Message, Role, ToolCall};
-pub use openai::{OPENAI_URL, OpenAi, guess_thinking, normalize_url, parse_models, parse_props};
+pub use ollama::{OLLAMA_CONTEXT, Ollama};
+pub use openai::{OpenAi, normalize_url, parse_models, parse_props};
+pub use profiles::{Control, Profile, Reasoning, Tuning, builtin as builtin_profiles, profile_for};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
@@ -65,90 +69,24 @@ impl Status {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Effort {
-    Low,
-    Medium,
-    High,
-    #[serde(rename = "xhigh")]
-    XHigh,
-    Max,
-}
-
-impl Effort {
-    pub const ALL: [Effort; 5] = [Effort::Low, Effort::Medium, Effort::High, Effort::XHigh, Effort::Max];
-
-    pub fn wire(self) -> &'static str {
-        match self {
-            Effort::Low => "low",
-            Effort::Medium => "medium",
-            Effort::High => "high",
-            Effort::XHigh => "xhigh",
-            Effort::Max => "max",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Effort::Low => "Low",
-            Effort::Medium => "Medium",
-            Effort::High => "High",
-            Effort::XHigh => "Extra high",
-            Effort::Max => "Max",
-        }
-    }
-
-    pub fn description(self) -> &'static str {
-        match self {
-            Effort::Low => "Quick answers, least thinking",
-            Effort::Medium => "Balanced speed and depth",
-            Effort::High => "Thinks things through",
-            Effort::XHigh => "Deeper reasoning for hard problems",
-            Effort::Max => "Everything it has, slowest",
-        }
-    }
-
-    pub fn nearest(self, offered: &[Effort]) -> Option<Effort> {
-        offered.iter().copied().min_by_key(|effort| (*effort as i32 - self as i32).abs() * 2 + i32::from(*effort > self))
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {
     pub id: String,
     pub name: Option<String>,
     pub status: Status,
     pub context: Option<u64>,
-    pub max_output: Option<u64>,
     pub vision: bool,
-    pub efforts: Vec<Effort>,
-    pub server_compaction: bool,
+    pub control: Option<Control>,
 }
 
 impl Model {
     pub fn new(id: impl Into<String>) -> Model {
-        Model {
-            id: id.into(),
-            name: None,
-            status: Status::Loaded,
-            context: None,
-            max_output: None,
-            vision: false,
-            efforts: Vec::new(),
-            server_compaction: false,
-        }
+        Model { id: id.into(), name: None, status: Status::Loaded, context: None, vision: false, control: None }
     }
 
     pub fn label(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.id)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Thinking {
-    None,
-    Toggle,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,7 +95,7 @@ pub struct Props {
     pub slots: u32,
     pub vision: bool,
     pub tools: bool,
-    pub thinking: Thinking,
+    pub control: Control,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -171,11 +109,10 @@ pub struct ToolSpec {
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<Message>,
-    pub thinking: Option<bool>,
-    pub effort: Option<Effort>,
-    pub max_tokens: Option<u64>,
-    pub server_compaction: bool,
+    pub reasoning: Option<Reasoning>,
+    pub kwargs: Map<String, Value>,
     pub tools: Vec<ToolSpec>,
+    pub context: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,16 +130,9 @@ pub struct Tokens {
     pub prompt: u64,
     pub completion: u64,
     pub cache_read: u64,
-    pub cache_write: u64,
 }
 
 impl Tokens {
-    pub fn from_anthropic(usage: &Value) -> Tokens {
-        let count = |key: &str| usage[key].as_u64().unwrap_or(0);
-        let (cache_read, cache_write) = (count("cache_read_input_tokens"), count("cache_creation_input_tokens"));
-        Tokens { prompt: count("input_tokens") + cache_read + cache_write, completion: count("output_tokens"), cache_read, cache_write }
-    }
-
     pub fn total(self) -> u64 {
         self.prompt + self.completion
     }
@@ -211,7 +141,6 @@ impl Tokens {
         self.prompt += other.prompt;
         self.completion += other.completion;
         self.cache_read += other.cache_read;
-        self.cache_write += other.cache_write;
     }
 }
 
@@ -221,7 +150,6 @@ pub enum Event {
     Content(String),
     ToolCall { index: usize, id: Option<String>, name: Option<String>, arguments: String },
     Usage(Tokens),
-    Native(Value),
     Stop(StopReason),
 }
 
@@ -245,7 +173,7 @@ pub fn context_label(tokens: u64) -> String {
 
 fn agent() -> ureq::Agent {
     use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
-    let tls = TlsConfig::builder().provider(TlsProvider::NativeTls).root_certs(RootCerts::PlatformVerifier).build();
+    let tls = TlsConfig::builder().provider(TlsProvider::Rustls).root_certs(RootCerts::PlatformVerifier).build();
     ureq::Agent::config_builder()
         .timeout_connect(Some(std::time::Duration::from_secs(8)))
         .http_status_as_error(false)
@@ -254,10 +182,20 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
+fn authorized<B>(request: ureq::RequestBuilder<B>, key: Option<&str>) -> ureq::RequestBuilder<B> {
+    match key {
+        Some(key) => request.header("Authorization", format!("Bearer {key}")),
+        None => request,
+    }
+}
+
 fn error_message(status: u16, body: &str) -> String {
+    if matches!(status, 401 | 403) {
+        return format!("The server turned the request down ({status}). Check the API key.");
+    }
     let detail = serde_json::from_str::<Value>(body)
         .ok()
-        .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+        .and_then(|v| v["error"]["message"].as_str().or(v["error"].as_str()).map(str::to_string))
         .unwrap_or_else(|| body.trim().chars().take(300).collect());
     if detail.is_empty() { format!("The server answered {status}.") } else { format!("The server answered {status}: {detail}") }
 }
@@ -306,15 +244,5 @@ mod tests {
         assert_eq!(context_label(32000), "32K");
         assert_eq!(context_label(1_000_000), "1M");
         assert_eq!(context_label(512), "512");
-    }
-
-    #[test]
-    fn efforts_fall_back_to_the_nearest_offered() {
-        let offered = [Effort::Low, Effort::Medium, Effort::High];
-        assert_eq!(Effort::Max.nearest(&offered), Some(Effort::High));
-        assert_eq!(Effort::Medium.nearest(&offered), Some(Effort::Medium));
-        assert_eq!(Effort::XHigh.nearest(&[Effort::Low, Effort::Max]), Some(Effort::Max));
-        assert_eq!(Effort::High.nearest(&[]), None);
-        assert_eq!(serde_json::to_string(&Effort::XHigh).unwrap(), "\"xhigh\"");
     }
 }

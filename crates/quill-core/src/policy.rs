@@ -114,9 +114,73 @@ pub fn read_only(command: &str, safe_commands: &[String]) -> bool {
     parts.peek().is_some() && parts.all(|part| safe_commands.iter().any(|safe| pattern_matches(safe, part)))
 }
 
+fn redirects_into_a_file(text: &str) -> bool {
+    text.match_indices('>').any(|(at, _)| {
+        let rest = text[at + 1..].trim_start_matches('>').trim_start();
+        let target = rest.split_whitespace().next().unwrap_or_default();
+        let to_stream = text[..at].ends_with(|c: char| c.is_ascii_digit()) && rest.starts_with('&');
+        !to_stream && !target.is_empty() && !target.starts_with('&') && !["/dev/null", "$null", "nul", "null"].contains(&target)
+    })
+}
+
+pub fn edits_files(command: &str) -> bool {
+    let text = command.to_lowercase();
+    let words: Vec<&str> = text
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '{' | '}' | '"' | '\''))
+        .filter(|word| !word.is_empty())
+        .collect();
+    let has = |word: &str| words.contains(&word);
+    let interpreter = ["python", "python3", "py", "node", "ruby", "perl", "php"].iter().any(|word| has(word));
+    let inline = has("-c") || has("-e") || text.contains("<<");
+    let writes = [".write(", "write_text", "write_bytes", "writefile", "appendfile"].iter().any(|marker| text.contains(marker));
+    let in_place = (has("sed") || has("perl")) && (text.contains(" -i") || text.contains(" -pi") || text.contains("--in-place"));
+    let cmdlets = ["set-content", "add-content", "out-file", "writealltext", "writealllines", "writeallbytes", "appendalltext"]
+        .iter()
+        .any(|cmdlet| text.contains(cmdlet))
+        || (has("new-item") && text.contains("-value"));
+    let printed = ["echo", "printf", "cat", "type", "write-output", "write-host"].iter().any(|word| has(word));
+    (interpreter && inline && writes) || in_place || cmdlets || has("tee") || has("tee-object") || (printed && redirects_into_a_file(&text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commands_that_edit_files_are_spotted() {
+        let edits = [
+            "python -c \"open('a.py','w').write('x')\"",
+            "python3 - <<'EOF'\nfrom pathlib import Path\nPath('a.txt').write_text('x')\nEOF",
+            "node -e \"require('fs').writeFileSync('a.js','x')\"",
+            "sed -i 's/a/b/' main.rs",
+            "perl -pi -e 's/a/b/' main.rs",
+            "Set-Content -Path a.txt -Value hi",
+            "'hi' | Out-File notes.md",
+            "[IO.File]::WriteAllText('a.txt', 'x')",
+            "New-Item a.txt -Value hi",
+            "echo hello > notes.txt",
+            "cat <<EOF > config.toml\nx = 1\nEOF",
+            "printf 'x' >> log.txt",
+            "echo x | tee a.txt",
+        ];
+        for command in edits {
+            assert!(edits_files(command), "{command}");
+        }
+        let runs = [
+            "python main.py",
+            "python -m pytest -q",
+            "cargo test 2>&1",
+            "npm run build > /dev/null",
+            "echo done",
+            "Get-Content a.txt | Select-String fn",
+            "git commit -m \"open the write path\"",
+            "node script.js",
+            "sed -n '1,20p' main.rs",
+        ];
+        for command in runs {
+            assert!(!edits_files(command), "{command}");
+        }
+    }
 
     fn safe() -> Vec<String> {
         ["git status", "Get-ChildItem", "Select-String"].iter().map(|s| s.to_string()).collect()

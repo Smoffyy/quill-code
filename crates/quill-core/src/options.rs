@@ -30,6 +30,15 @@ impl Shell {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinalNewline {
+    #[default]
+    Keep,
+    Remove,
+    Add,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Toolsets {
     pub git: bool,
@@ -49,13 +58,13 @@ pub struct Limits {
     pub max_output: usize,
     pub max_read_lines: usize,
     pub max_matches: usize,
-    pub max_list: usize,
-    pub compact_at: f32,
+    pub auto_compact: bool,
     pub parallel_tools: bool,
     pub shell: Shell,
     pub ignored: Vec<String>,
     pub safe_commands: Vec<String>,
     pub disabled_tools: Vec<String>,
+    pub final_newline: FinalNewline,
 }
 
 pub const IGNORED: [&str; 13] =
@@ -107,13 +116,13 @@ impl Default for Limits {
             max_output: 30_000,
             max_read_lines: 1500,
             max_matches: 200,
-            max_list: 400,
-            compact_at: 0.8,
+            auto_compact: true,
             parallel_tools: true,
             shell: Shell::default(),
             ignored: IGNORED.iter().map(|s| s.to_string()).collect(),
             safe_commands: SAFE_COMMANDS.iter().map(|s| s.to_string()).collect(),
             disabled_tools: Vec::new(),
+            final_newline: FinalNewline::Keep,
         }
     }
 }

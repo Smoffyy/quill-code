@@ -7,6 +7,7 @@ pub enum LineKind {
     Added,
     Removed,
     Gap,
+    Note,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +30,7 @@ pub struct FileDiff {
 pub fn diff_text(path: &str, before: Option<&str>, after: &str) -> FileDiff {
     let old = before.unwrap_or_default();
     let diff = TextDiff::from_lines(old, after);
+    let newline_changed = old.ends_with('\n') != after.ends_with('\n');
     let mut lines = Vec::new();
     let (mut added, mut removed) = (0, 0);
     for (index, group) in diff.grouped_ops(3).iter().enumerate() {
@@ -54,6 +56,9 @@ pub fn diff_text(path: &str, before: Option<&str>, after: &str) -> FileDiff {
                     new: change.new_index().map(|i| i + 1),
                     text: change.value().trim_end_matches(['\n', '\r']).to_string(),
                 });
+                if newline_changed && kind != LineKind::Context && !change.value().ends_with('\n') {
+                    lines.push(DiffLine { kind: LineKind::Note, old: None, new: None, text: "No newline at end of file".into() });
+                }
             }
         }
     }
@@ -81,6 +86,14 @@ mod tests {
         let removed = diff.lines.iter().find(|l| l.kind == LineKind::Removed).unwrap();
         assert_eq!((removed.old, removed.text.as_str()), (Some(2), "b"));
         assert!(diff.lines.iter().any(|l| l.kind == LineKind::Context));
+    }
+
+    #[test]
+    fn a_removed_final_newline_is_noted() {
+        let kinds = |diff: FileDiff| diff.lines.iter().map(|l| l.kind).collect::<Vec<_>>();
+        let removed = diff_text("x", Some("a\nb\n"), "a\nb");
+        assert_eq!(kinds(removed), [LineKind::Context, LineKind::Removed, LineKind::Added, LineKind::Note]);
+        assert!(!kinds(diff_text("x", Some("a\nb"), "a\nc")).contains(&LineKind::Note));
     }
 
     #[test]

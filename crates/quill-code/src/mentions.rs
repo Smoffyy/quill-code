@@ -92,63 +92,120 @@ pub fn mentioned(text: &str) -> Vec<String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     New,
+    Connect,
+    Clear,
+    Resume,
     Model,
-    Reasoning,
+    Effort,
     Mode,
-    Review,
-    Files,
-    Terminal,
-    Commit,
     Init,
+    Instructions,
     Compact,
+    Retry,
+    Diff,
+    Usage,
+    Version,
+    Commit,
+    Branch,
+    Rename,
+    Help,
+    Quit,
 }
 
 impl Command {
-    pub const ALL: [Command; 10] = [
+    pub const ALL: [Command; 19] = [
         Command::New,
-        Command::Init,
+        Command::Connect,
+        Command::Clear,
+        Command::Resume,
         Command::Model,
-        Command::Reasoning,
+        Command::Effort,
         Command::Mode,
-        Command::Review,
-        Command::Files,
-        Command::Terminal,
-        Command::Commit,
+        Command::Init,
+        Command::Instructions,
         Command::Compact,
+        Command::Retry,
+        Command::Diff,
+        Command::Usage,
+        Command::Version,
+        Command::Commit,
+        Command::Branch,
+        Command::Rename,
+        Command::Help,
+        Command::Quit,
     ];
 
     pub fn name(self) -> &'static str {
         match self {
             Command::New => "new",
+            Command::Connect => "connect",
+            Command::Clear => "clear",
+            Command::Resume => "resume",
             Command::Model => "model",
-            Command::Reasoning => "think",
+            Command::Effort => "effort",
             Command::Mode => "mode",
-            Command::Review => "review",
-            Command::Files => "files",
-            Command::Terminal => "terminal",
-            Command::Commit => "commit",
             Command::Init => "init",
+            Command::Instructions => "instructions",
             Command::Compact => "compact",
+            Command::Retry => "retry",
+            Command::Diff => "diff",
+            Command::Usage => "usage",
+            Command::Version => "version",
+            Command::Commit => "commit",
+            Command::Branch => "branch",
+            Command::Rename => "rename",
+            Command::Help => "help",
+            Command::Quit => "quit",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
             Command::New => "Start a fresh thread in this project",
-            Command::Model => "Pick a different model for the next reply",
-            Command::Reasoning => "Turn reasoning on or off",
+            Command::Connect => "Connect another model server, such as Ollama or LM Studio",
+            Command::Clear => "Clear the screen and start a fresh thread",
+            Command::Resume => "Go back to an earlier thread in this project",
+            Command::Model => "Pick the model that powers Quill",
+            Command::Effort => "Turn thinking on or off, or pick the effort level",
             Command::Mode => "Choose how much the agent may do without asking",
-            Command::Review => "Look over what changed in the last reply",
-            Command::Files => "Browse the project's files",
-            Command::Terminal => "Open a PowerShell terminal in the project",
-            Command::Commit => "Commit your work, then push or open a pull request",
             Command::Init => "Have the agent write an AGENTS.md that explains this project",
-            Command::Compact => "Summarise earlier turns to free up the model's context",
+            Command::Instructions => "Edit your personal AGENTS.md, which every session reads",
+            Command::Compact => "Summarise the conversation to free up the model's context",
+            Command::Retry => "Send the last prompt again",
+            Command::Diff => "Show everything the last reply changed",
+            Command::Usage => "How many tokens this thread and everything else used",
+            Command::Version => "Switch to another released version of Quill Code",
+            Command::Commit => "Commit your work, then push or open a pull request",
+            Command::Branch => "Switch to another branch or create one",
+            Command::Rename => "Rename this thread: /rename <title>",
+            Command::Help => "Commands and keys",
+            Command::Quit => "Leave Quill Code",
         }
     }
 
+    pub fn widest() -> usize {
+        Command::ALL.iter().map(|command| command.name().len()).max().unwrap_or(0)
+    }
+
     pub fn matching(query: &str) -> Vec<Command> {
-        Command::ALL.into_iter().filter(|c| c.name().starts_with(query)).collect()
+        let mut found: Vec<Command> = Command::ALL.into_iter().filter(|c| c.name().starts_with(query)).collect();
+        found.sort_by_key(|c| c.name() != query);
+        found
+    }
+
+    pub fn parse(text: &str) -> Option<(Command, String)> {
+        let rest = text.trim().strip_prefix('/')?;
+        let (name, argument) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let name = name.to_lowercase();
+        let command = match name.as_str() {
+            "exit" => Command::Quit,
+            "review" => Command::Diff,
+            "reasoning" | "think" => Command::Effort,
+            "memory" | "agents" => Command::Instructions,
+            "versions" | "update" => Command::Version,
+            _ => Command::ALL.into_iter().find(|c| c.name() == name)?,
+        };
+        Some((command, argument.trim().to_string()))
     }
 }
 
@@ -185,7 +242,17 @@ mod tests {
 
     #[test]
     fn commands_filter_by_prefix() {
-        assert_eq!(Command::matching("te"), vec![Command::Terminal]);
+        assert_eq!(Command::matching("re"), vec![Command::Resume, Command::Retry, Command::Rename]);
         assert_eq!(Command::matching("").len(), Command::ALL.len());
+        assert_eq!(Command::matching("mode"), vec![Command::Mode, Command::Model]);
+    }
+
+    #[test]
+    fn typed_commands_parse_with_their_argument() {
+        assert_eq!(Command::parse("/rename  Fix the build "), Some((Command::Rename, "Fix the build".into())));
+        assert_eq!(Command::parse("/MODEL"), Some((Command::Model, String::new())));
+        assert_eq!(Command::parse("/exit"), Some((Command::Quit, String::new())));
+        assert_eq!(Command::parse("/nope"), None);
+        assert_eq!(Command::parse("plain text"), None);
     }
 }

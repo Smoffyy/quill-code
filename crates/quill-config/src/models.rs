@@ -1,99 +1,104 @@
-use quill_providers::{ANTHROPIC_URL, Effort, OPENAI_URL, Tokens, normalize_url};
+use quill_providers::Profile;
 use serde::{Deserialize, Serialize};
-
-pub const DEFAULT_SERVER: &str = "http://127.0.0.1:9931";
-pub const LOCAL_PORTS: [u16; 6] = [9931, 8080, 1234, 11434, 8000, 5000];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ProviderKind {
+pub enum ServerKind {
+    LlamaCpp,
+    LmStudio,
+    Ollama,
+    Vllm,
+    Jan,
+    Gpt4All,
     #[default]
-    Local,
-    OpenAi,
-    Anthropic,
-    ClaudeCode,
+    #[serde(other)]
+    Custom,
 }
 
-impl ProviderKind {
-    pub const ALL: [ProviderKind; 4] = [ProviderKind::Local, ProviderKind::OpenAi, ProviderKind::Anthropic, ProviderKind::ClaudeCode];
+impl ServerKind {
+    pub const ALL: [ServerKind; 7] = [
+        ServerKind::LlamaCpp,
+        ServerKind::LmStudio,
+        ServerKind::Ollama,
+        ServerKind::Vllm,
+        ServerKind::Jan,
+        ServerKind::Gpt4All,
+        ServerKind::Custom,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
-            ProviderKind::Local => "Local server",
-            ProviderKind::OpenAi => "OpenAI-compatible",
-            ProviderKind::Anthropic => "Anthropic",
-            ProviderKind::ClaudeCode => "Claude Code",
+            ServerKind::LlamaCpp => "llama.cpp",
+            ServerKind::LmStudio => "LM Studio",
+            ServerKind::Ollama => "Ollama",
+            ServerKind::Vllm => "vLLM",
+            ServerKind::Jan => "Jan",
+            ServerKind::Gpt4All => "GPT4All",
+            ServerKind::Custom => "Another server",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
-            ProviderKind::Local => "llama.cpp, LM Studio, Ollama, vLLM or anything with an OpenAI-style API on your network",
-            ProviderKind::OpenAi => "OpenAI or a hosted OpenAI-style service such as OpenRouter, with an API key",
-            ProviderKind::Anthropic => "Claude models through the Anthropic API, with an API key",
-            ProviderKind::ClaudeCode => "Claude models through your installed Claude Code and its sign-in, no key needed",
+            ServerKind::LlamaCpp => "llama-server",
+            ServerKind::LmStudio => "turn on the server in the Developer tab",
+            ServerKind::Ollama => "ollama serve",
+            ServerKind::Vllm => "vllm serve, with --enable-auto-tool-choice for tools",
+            ServerKind::Jan => "turn on the Local API Server in Settings",
+            ServerKind::Gpt4All => "turn on the API server in Settings",
+            ServerKind::Custom => "anything with an OpenAI-compatible API",
         }
     }
 
-    pub fn needs_key(self) -> bool {
-        matches!(self, ProviderKind::OpenAi | ProviderKind::Anthropic)
-    }
-
-    pub fn default_url(self) -> &'static str {
+    pub fn port(self) -> Option<u16> {
         match self {
-            ProviderKind::Local => DEFAULT_SERVER,
-            ProviderKind::OpenAi => OPENAI_URL,
-            ProviderKind::Anthropic => ANTHROPIC_URL,
-            ProviderKind::ClaudeCode => "",
+            ServerKind::LlamaCpp => Some(9931),
+            ServerKind::LmStudio => Some(1234),
+            ServerKind::Ollama => Some(11434),
+            ServerKind::Vllm => Some(8000),
+            ServerKind::Jan => Some(1337),
+            ServerKind::Gpt4All => Some(4891),
+            ServerKind::Custom => None,
         }
     }
 
-    pub fn env_key(self) -> Option<&'static str> {
+    pub fn default_url(self) -> String {
+        self.port().map(|port| format!("http://127.0.0.1:{port}")).unwrap_or_default()
+    }
+
+    pub fn asks_key(self) -> bool {
+        !matches!(self, ServerKind::Ollama | ServerKind::Gpt4All)
+    }
+
+    fn slug(self) -> &'static str {
         match self {
-            ProviderKind::OpenAi => Some("OPENAI_API_KEY"),
-            ProviderKind::Anthropic => Some("ANTHROPIC_API_KEY"),
-            _ => None,
+            ServerKind::LlamaCpp => "llama-cpp",
+            ServerKind::LmStudio => "lm-studio",
+            ServerKind::Ollama => "ollama",
+            ServerKind::Vllm => "vllm",
+            ServerKind::Jan => "jan",
+            ServerKind::Gpt4All => "gpt4all",
+            ServerKind::Custom => "server",
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Provider {
     pub id: String,
     pub name: String,
-    pub kind: ProviderKind,
+    pub kind: ServerKind,
     pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     pub enabled: bool,
-    pub models: Vec<String>,
-    pub fallback: bool,
-}
-
-impl Default for Provider {
-    fn default() -> Self {
-        Provider::new("local", "Local server", ProviderKind::Local)
-    }
 }
 
 impl Provider {
-    pub fn new(id: &str, name: &str, kind: ProviderKind) -> Provider {
-        let models =
-            if kind == ProviderKind::ClaudeCode { ["fable", "opus", "sonnet", "haiku"].map(String::from).to_vec() } else { Vec::new() };
-        Provider { id: id.into(), name: name.into(), kind, url: kind.default_url().into(), enabled: true, models, fallback: true }
+    pub fn new(id: &str, kind: ServerKind, url: &str) -> Provider {
+        Provider { id: id.into(), name: kind.label().into(), kind, url: url.into(), key: None, enabled: true }
     }
-
-    pub fn official(&self) -> bool {
-        self.kind.needs_key() && normalize_url(&self.url) == normalize_url(self.kind.default_url())
-    }
-}
-
-pub fn default_providers() -> Vec<Provider> {
-    vec![
-        Provider::new("local", "Local server", ProviderKind::Local),
-        Provider::new("claude-code", "Claude Code", ProviderKind::ClaudeCode),
-        Provider::new("anthropic", "Anthropic", ProviderKind::Anthropic),
-        Provider::new("openai", "OpenAI", ProviderKind::OpenAi),
-    ]
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -133,67 +138,13 @@ pub struct Roles {
     pub subagent: Option<ModelRef>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Price {
-    pub input: f64,
-    pub output: f64,
-    pub cache_read: f64,
-    pub cache_write: f64,
-}
-
-impl Price {
-    pub fn new(input: f64, output: f64) -> Price {
-        Price { input, output, cache_read: input * 0.1, cache_write: input * 1.25 }
-    }
-
-    pub fn cost(&self, tokens: Tokens) -> f64 {
-        let fresh = tokens.prompt.saturating_sub(tokens.cache_read + tokens.cache_write) as f64;
-        let total = fresh * self.input
-            + tokens.cache_read as f64 * self.cache_read
-            + tokens.cache_write as f64 * self.cache_write
-            + tokens.completion as f64 * self.output;
-        total / 1_000_000.0
-    }
-}
-
-const ANTHROPIC_PRICES: [(&str, f64, f64, Option<f64>); 11] = [
-    ("claude-fable-5-1", 10.0, 50.0, Some(0.25)),
-    ("claude-mythos-5-1", 10.0, 50.0, Some(0.25)),
-    ("claude-fable-5", 10.0, 50.0, Some(1.0)),
-    ("claude-mythos-5", 10.0, 50.0, Some(1.0)),
-    ("claude-opus-5-5", 4.0, 20.0, Some(0.2)),
-    ("claude-opus-5", 5.0, 25.0, None),
-    ("claude-opus-4", 5.0, 25.0, None),
-    ("claude-sonnet-5", 2.0, 10.0, Some(0.2)),
-    ("claude-sonnet-4", 3.0, 15.0, None),
-    ("claude-haiku-5", 0.1, 0.5, None),
-    ("claude-haiku-4", 1.0, 5.0, None),
-];
-
-pub fn default_price(model: &str) -> Option<Price> {
-    let (_, input, output, read) = ANTHROPIC_PRICES.iter().find(|(family, ..)| model.starts_with(family))?;
-    let price = Price::new(*input, *output);
-    Some(Price { cache_read: read.unwrap_or(price.cache_read), ..price })
-}
-
-const CLAUDE_LATEST: [(&str, &str); 4] =
-    [("fable", "claude-fable-5-1"), ("opus", "claude-opus-5-5"), ("sonnet", "claude-sonnet-5-5"), ("haiku", "claude-haiku-5-5")];
-
-pub fn claude_latest(alias: &str) -> Option<&'static str> {
-    CLAUDE_LATEST.iter().find(|(name, _)| *name == alias).map(|(_, id)| *id)
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Override {
     pub model: ModelRef,
     #[serde(default)]
     pub context: Option<u64>,
     #[serde(default)]
-    pub max_output: Option<u64>,
-    #[serde(default)]
     pub vision: Option<bool>,
-    #[serde(default)]
-    pub price: Option<Price>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -203,21 +154,23 @@ pub struct Models {
     pub selected: Option<ModelRef>,
     pub pinned: Vec<ModelRef>,
     pub thinking: bool,
-    pub effort: Effort,
+    pub effort: String,
     pub roles: Roles,
     pub overrides: Vec<Override>,
+    pub profiles: Vec<Profile>,
 }
 
 impl Default for Models {
     fn default() -> Self {
         Models {
-            providers: default_providers(),
+            providers: Vec::new(),
             selected: None,
             pinned: Vec::new(),
             thinking: true,
-            effort: Effort::High,
+            effort: "medium".into(),
             roles: Roles::default(),
             overrides: Vec::new(),
+            profiles: Vec::new(),
         }
     }
 }
@@ -231,26 +184,9 @@ impl Models {
         self.overrides.iter().find(|entry| entry.model == *model)
     }
 
-    pub fn override_mut(&mut self, model: &ModelRef) -> &mut Override {
-        let index = match self.overrides.iter().position(|entry| entry.model == *model) {
-            Some(index) => index,
-            None => {
-                self.overrides.push(Override { model: model.clone(), context: None, max_output: None, vision: None, price: None });
-                self.overrides.len() - 1
-            }
-        };
-        &mut self.overrides[index]
-    }
-
-    pub fn fresh_id(&self, kind: ProviderKind) -> String {
-        let base = match kind {
-            ProviderKind::Local => "local",
-            ProviderKind::OpenAi => "openai",
-            ProviderKind::Anthropic => "anthropic",
-            ProviderKind::ClaudeCode => "claude-code",
-        };
+    pub fn fresh_id(&self, kind: ServerKind) -> String {
         (1..)
-            .map(|n| if n == 1 { base.to_string() } else { format!("{base}-{n}") })
+            .map(|n| if n == 1 { kind.slug().to_string() } else { format!("{}-{n}", kind.slug()) })
             .find(|id| self.provider(id).is_none())
             .unwrap_or_default()
     }
@@ -264,41 +200,37 @@ mod tests {
     fn model_refs_read_old_plain_names() {
         let old: ModelRef = serde_json::from_str("\"qwen3.5-4b\"").unwrap();
         assert_eq!(old, ModelRef::new("local", "qwen3.5-4b"));
-        let new: ModelRef = serde_json::from_str(r#"{ "provider": "openai", "model": "gpt-5" }"#).unwrap();
-        assert_eq!(new, ModelRef::new("openai", "gpt-5"));
-        assert_eq!(serde_json::to_value(&new).unwrap()["provider"], "openai");
+        let new: ModelRef = serde_json::from_str(r#"{ "provider": "local-2", "model": "gemma" }"#).unwrap();
+        assert_eq!(new, ModelRef::new("local-2", "gemma"));
+        assert_eq!(serde_json::to_value(&new).unwrap()["provider"], "local-2");
     }
 
     #[test]
-    fn providers_know_their_defaults() {
-        let models = Models::default();
-        assert_eq!(models.providers.len(), 4);
-        assert_eq!(models.provider("claude-code").unwrap().models.len(), 4);
-        assert!(models.provider("anthropic").unwrap().official());
-        assert!(!models.provider("local").unwrap().official());
-        assert_eq!(models.fresh_id(ProviderKind::Local), "local-2");
-        assert_eq!(models.fresh_id(ProviderKind::ClaudeCode), "claude-code-2");
+    fn new_servers_get_the_next_free_id() {
+        let mut models = Models::default();
+        assert!(models.providers.is_empty());
+        assert_eq!(models.fresh_id(ServerKind::Ollama), "ollama");
+        models.providers.push(Provider::new("ollama", ServerKind::Ollama, "http://127.0.0.1:11434"));
+        assert_eq!(models.fresh_id(ServerKind::Ollama), "ollama-2");
     }
 
     #[test]
-    fn prices_follow_the_model_family_and_the_cache() {
-        let opus = default_price("claude-opus-5-5").unwrap();
-        assert_eq!((opus.input, opus.output, opus.cache_read), (4.0, 20.0, 0.2));
-        assert_eq!(default_price("claude-opus-5").unwrap().input, 5.0);
-        assert!(default_price("gpt-5").is_none());
-        let tokens = Tokens { prompt: 1_000_000, completion: 100_000, cache_read: 800_000, cache_write: 0 };
-        assert!((opus.cost(tokens) - (0.2 * 4.0 + 0.8 * 0.2 + 0.1 * 20.0)).abs() < 1e-9);
-        assert_eq!(claude_latest("haiku"), Some("claude-haiku-5-5"));
+    fn servers_know_their_kind_and_keys_stay_out_of_the_file_when_empty() {
+        let provider = Provider::new("jan", ServerKind::Jan, &ServerKind::Jan.default_url());
+        assert_eq!(provider.url, "http://127.0.0.1:1337");
+        let saved = serde_json::to_value(&provider).unwrap();
+        assert_eq!(saved["kind"], "jan");
+        assert!(saved.get("key").is_none());
+        let unknown: Provider = serde_json::from_str(r#"{ "kind": "something_new", "url": "http://box" }"#).unwrap();
+        assert_eq!(unknown.kind, ServerKind::Custom);
     }
 
     #[test]
-    fn overrides_are_created_on_demand() {
+    fn overrides_are_found_by_model() {
         let mut models = Models::default();
         let model = ModelRef::new("local", "m");
         assert!(models.override_for(&model).is_none());
-        models.override_mut(&model).context = Some(8192);
-        models.override_mut(&model).vision = Some(true);
-        assert_eq!(models.overrides.len(), 1);
+        models.overrides.push(Override { model: model.clone(), context: Some(8192), vision: None });
         assert_eq!(models.override_for(&model).unwrap().context, Some(8192));
     }
 }

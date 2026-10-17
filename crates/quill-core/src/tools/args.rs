@@ -11,7 +11,6 @@ pub const MESSAGE: [&str; 3] = ["message", "commit_message", "msg"];
 pub const BRANCH: [&str; 3] = ["branch", "branch_name", "new_branch"];
 pub const TITLE: [&str; 2] = ["title", "pr_title"];
 pub const BODY: [&str; 3] = ["body", "description", "pr_body"];
-pub const PATCH: [&str; 4] = ["patch", "input", "diff", "content"];
 
 pub fn parse(arguments: &str) -> Value {
     let text = arguments.trim();

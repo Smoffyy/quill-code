@@ -220,10 +220,6 @@ pub fn branches(root: &Path) -> Branches {
     Branches { current, local, remote, unmerged }
 }
 
-pub fn delete_branch(root: &Path, name: &str) -> Result<(), String> {
-    run(root, &["branch", "-D", name]).map(|_| ())
-}
-
 pub fn switch_branch(root: &Path, name: &str) -> Result<(), String> {
     run(root, &["switch", name]).map(|_| ())
 }
@@ -291,11 +287,6 @@ pub fn add_worktree(project: &Path, path: &Path) -> Result<(), String> {
     run(project, &["worktree", "add", "--detach", &target]).map(|_| ()).map_err(|error| {
         if error.contains("invalid reference") { "An isolated copy needs at least one commit in the project first.".into() } else { error }
     })
-}
-
-pub fn remove_worktree(project: &Path, path: &Path) -> Result<(), String> {
-    let target = path.to_string_lossy().into_owned();
-    run(project, &["worktree", "remove", "--force", &target]).map(|_| ())
 }
 
 #[cfg(test)]

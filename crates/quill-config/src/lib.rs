@@ -1,55 +1,23 @@
 mod models;
 mod paths;
-mod secrets;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use quill_core::{Access, Limits, Rule, Shell};
+use quill_core::{Access, FinalNewline, Limits, Rule, Shell};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use models::{
-    DEFAULT_SERVER, LOCAL_PORTS, ModelRef, Models, Override, Price, Provider, ProviderKind, Roles, claude_latest, default_price,
-    default_providers,
-};
-pub use paths::{app_dir, home_dir, personal_instructions_path, read_personal_instructions, write_personal_instructions};
-pub use secrets::{KeySource, api_key, forget_key, key_source, store_key};
+pub use models::{ModelRef, Models, Override, Provider, Roles, ServerKind};
+pub use paths::{app_dir, home_dir, personal_instructions_path, read_personal_instructions};
 
 pub const INSTRUCTION_FILES: [&str; 4] = ["AGENTS.md", "CLAUDE.md", "GEMINI.md", ".github/copilot-instructions.md"];
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct General {
-    pub projects: Vec<PathBuf>,
-    pub projects_dir: Option<PathBuf>,
     pub worktrees_dir: Option<PathBuf>,
-    pub remember_project: bool,
-    pub last_project: Option<PathBuf>,
-}
-
-impl Default for General {
-    fn default() -> Self {
-        General { projects: Vec::new(), projects_dir: None, worktrees_dir: None, remember_project: true, last_project: None }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Theme {
-    #[default]
-    System,
-    Dark,
-    Light,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Motion {
-    #[default]
-    Full,
-    Reduced,
-    Off,
+    pub trusted: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,24 +32,13 @@ pub enum Reasoning {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Appearance {
-    pub theme: Theme,
-    pub motion: Motion,
     pub reasoning: Reasoning,
-    pub transcript_width: u16,
-    pub sidebar: bool,
     pub group_exploration: bool,
 }
 
 impl Default for Appearance {
     fn default() -> Self {
-        Appearance {
-            theme: Theme::System,
-            motion: Motion::Full,
-            reasoning: Reasoning::Collapsed,
-            transcript_width: 820,
-            sidebar: true,
-            group_exploration: true,
-        }
+        Appearance { reasoning: Reasoning::Collapsed, group_exploration: true }
     }
 }
 
@@ -91,7 +48,6 @@ pub struct Agent {
     pub access: Access,
     pub max_steps: usize,
     pub auto_compact: bool,
-    pub compact_at: u8,
     pub parallel_tools: bool,
     pub instruction_files: Vec<String>,
 }
@@ -103,7 +59,6 @@ impl Default for Agent {
             access: Access::Full,
             max_steps: limits.max_steps,
             auto_compact: true,
-            compact_at: (limits.compact_at * 100.0).round() as u8,
             parallel_tools: limits.parallel_tools,
             instruction_files: INSTRUCTION_FILES.iter().map(|s| s.to_string()).collect(),
         }
@@ -119,9 +74,9 @@ pub struct Tools {
     pub max_output: usize,
     pub max_read_lines: usize,
     pub max_matches: usize,
-    pub max_list: usize,
     pub ignored: Vec<String>,
     pub disabled: Vec<String>,
+    pub final_newline: FinalNewline,
     pub git: bool,
 }
 
@@ -135,9 +90,9 @@ impl Default for Tools {
             max_output: limits.max_output,
             max_read_lines: limits.max_read_lines,
             max_matches: limits.max_matches,
-            max_list: limits.max_list,
             ignored: limits.ignored,
             disabled: Vec::new(),
+            final_newline: limits.final_newline,
             git: true,
         }
     }
@@ -167,44 +122,6 @@ pub struct Settings {
     pub permissions: Permissions,
 }
 
-#[derive(Deserialize)]
-#[serde(default)]
-struct Legacy {
-    server_url: String,
-    model: Option<String>,
-    thinking: bool,
-    #[serde(alias = "mode")]
-    access: Access,
-    projects: Vec<PathBuf>,
-    pinned_models: Vec<String>,
-}
-
-impl Default for Legacy {
-    fn default() -> Self {
-        Legacy {
-            server_url: DEFAULT_SERVER.into(),
-            model: None,
-            thinking: true,
-            access: Access::Full,
-            projects: Vec::new(),
-            pinned_models: Vec::new(),
-        }
-    }
-}
-
-impl From<Legacy> for Settings {
-    fn from(old: Legacy) -> Settings {
-        let mut settings = Settings::default();
-        settings.models.providers[0].url = old.server_url;
-        settings.models.selected = old.model.map(|model| ModelRef::new("local", model));
-        settings.models.thinking = old.thinking;
-        settings.models.pinned = old.pinned_models.into_iter().map(|model| ModelRef::new("local", model)).collect();
-        settings.agent.access = old.access;
-        settings.general.projects = old.projects;
-        settings
-    }
-}
-
 pub fn settings_path() -> PathBuf {
     app_dir().join("settings.json")
 }
@@ -230,35 +147,17 @@ pub struct Loaded {
 }
 
 pub fn parse(text: &str) -> Result<Settings, String> {
-    let mut value: Value = serde_json::from_str(text).map_err(|e| format!("settings.json could not be read: {e}"))?;
-    migrate(&mut value);
-    serde_json::from_value(value).map_err(|e| format!("settings.json could not be read: {e}"))
-}
-
-fn migrate(value: &mut Value) {
-    let Some(models) = value.get_mut("models").and_then(Value::as_object_mut) else { return };
-    let Some(url) = models.remove("server_url") else { return };
-    if !models.contains_key("providers") {
-        let mut providers = default_providers();
-        if let Some(url) = url.as_str() {
-            providers[0].url = url.to_string();
-        }
-        models.insert("providers".into(), serde_json::to_value(providers).unwrap_or_default());
-    }
+    serde_json::from_str(text).map_err(|e| format!("settings.json could not be read: {e}"))
 }
 
 pub fn load() -> Loaded {
     match fs::read_to_string(settings_path()) {
-        Ok(text) => match parse(&text) {
+        Ok(text) if !text.trim().is_empty() => match parse(&text) {
             Ok(settings) => Loaded { settings, error: None },
             Err(error) => Loaded { settings: Settings::default(), error: Some(error) },
         },
-        Err(_) => {
-            let settings = fs::read_to_string(app_dir().join("config.json"))
-                .ok()
-                .and_then(|text| serde_json::from_str::<Legacy>(&text).ok())
-                .map(Settings::from)
-                .unwrap_or_default();
+        _ => {
+            let settings = Settings::default();
             let _ = save(&settings);
             Loaded { settings, error: None }
         }
@@ -266,9 +165,24 @@ pub fn load() -> Loaded {
 }
 
 pub fn save(settings: &Settings) -> std::io::Result<()> {
-    let text = serde_json::to_string_pretty(settings).map_err(std::io::Error::other)?;
-    fs::create_dir_all(app_dir())?;
-    fs::write(settings_path(), text)
+    let path = settings_path();
+    let value = keep_unknown(&path, serde_json::to_value(settings).map_err(std::io::Error::other)?);
+    write_atomic(&path, &serde_json::to_string_pretty(&value).map_err(std::io::Error::other)?)
+}
+
+pub fn keep_unknown(path: &Path, value: Value) -> Value {
+    let mut saved = fs::read_to_string(path).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or(Value::Null);
+    merge(&mut saved, value);
+    saved
+}
+
+pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    fs::write(&temp, text)?;
+    fs::rename(&temp, path)
 }
 
 impl Settings {
@@ -288,35 +202,28 @@ impl Settings {
             max_output: self.tools.max_output.max(1000),
             max_read_lines: self.tools.max_read_lines.max(10),
             max_matches: self.tools.max_matches.max(1),
-            max_list: self.tools.max_list.max(10),
-            compact_at: if self.agent.auto_compact { f32::from(self.agent.compact_at.clamp(30, 98)) / 100.0 } else { f32::MAX },
+            auto_compact: self.agent.auto_compact,
             parallel_tools: self.agent.parallel_tools,
             shell: self.tools.shell,
             ignored: self.tools.ignored.clone(),
             safe_commands: self.permissions.safe_commands.clone(),
             disabled_tools: self.tools.disabled.clone(),
+            final_newline: self.tools.final_newline,
         }
-    }
-
-    pub fn projects_dir(&self) -> PathBuf {
-        self.general.projects_dir.clone().unwrap_or_else(|| home_dir().join(".quill-code").join("projects"))
     }
 
     pub fn worktrees_dir(&self) -> PathBuf {
         self.general.worktrees_dir.clone().unwrap_or_else(|| home_dir().join(".quill-code").join("worktrees"))
     }
 
-    pub fn add_project(&mut self, path: PathBuf) {
-        self.general.projects.retain(|p| p != &path);
-        self.general.projects.insert(0, path);
-    }
-
-    pub fn value(&self) -> Value {
-        serde_json::to_value(self).unwrap_or(Value::Null)
-    }
-
-    pub fn defaults() -> Value {
-        Settings::default().value()
+    pub fn reset(&self) -> Settings {
+        let mut fresh = Settings::default();
+        fresh.models.providers = self.models.providers.clone();
+        fresh.models.selected = self.models.selected.clone();
+        fresh.models.pinned = self.models.pinned.clone();
+        fresh.models.profiles = self.models.profiles.clone();
+        fresh.general.trusted = self.general.trusted.clone();
+        fresh
     }
 }
 
@@ -331,33 +238,37 @@ mod tests {
         let settings = parse(r#"{ "agent": { "max_steps": 12 } }"#).unwrap();
         assert_eq!(settings.agent.max_steps, 12);
         assert_eq!(settings.tools, Tools::default());
-        assert_eq!(settings.models.providers[0].url, DEFAULT_SERVER);
         assert!(parse("{ broken").is_err());
     }
 
     #[test]
-    fn a_single_server_becomes_the_local_provider() {
-        let settings = parse(r#"{ "models": { "server_url": "http://box:8080", "selected": "qwen", "pinned": ["qwen"] } }"#).unwrap();
-        assert_eq!(settings.models.providers.len(), 4);
-        assert_eq!(settings.models.provider("local").unwrap().url, "http://box:8080");
-        assert_eq!(settings.models.selected, Some(ModelRef::new("local", "qwen")));
-        assert_eq!(settings.models.pinned, vec![ModelRef::new("local", "qwen")]);
+    fn settings_from_the_desktop_app_still_load() {
+        let old = r#"{
+            "general": { "projects": ["C:\\work\\a"], "projects_dir": null, "worktrees_dir": "D:\\trees", "remember_project": true },
+            "appearance": { "theme": "dark", "motion": "off", "reasoning": "hidden", "transcript_width": 820, "sidebar": false }
+        }"#;
+        let settings = parse(old).unwrap();
+        assert_eq!(settings.general.worktrees_dir, Some(PathBuf::from("D:\\trees")));
+        assert_eq!(settings.appearance.reasoning, Reasoning::Hidden);
+        assert!(settings.appearance.group_exploration);
+        let saved = serde_json::to_string(&settings).unwrap();
+        assert!(!saved.contains("theme") && !saved.contains("projects"));
     }
 
     #[test]
-    fn old_config_files_migrate() {
-        let old: Legacy = serde_json::from_value(json!({
-            "server_url": "http://box:8080", "model": "qwen", "thinking": false, "mode": "manual",
-            "projects": ["C:\\work\\a"], "pinned_models": ["qwen"]
-        }))
-        .unwrap();
-        let settings = Settings::from(old);
-        assert_eq!(settings.models.providers[0].url, "http://box:8080");
-        assert_eq!(settings.models.selected, Some(ModelRef::new("local", "qwen")));
-        assert!(!settings.models.thinking);
-        assert_eq!(settings.agent.access, Access::Supervised);
-        assert_eq!(settings.general.projects, vec![PathBuf::from("C:\\work\\a")]);
-        assert_eq!(settings.models.pinned, vec![ModelRef::new("local", "qwen")]);
+    fn a_reset_keeps_the_models() {
+        let mut settings = Settings::default();
+        settings.models.selected = Some(ModelRef::new("local", "qwen"));
+        settings.models.pinned = vec![ModelRef::new("local", "qwen")];
+        settings.models.providers.push(Provider::new("ollama", ServerKind::Ollama, "http://box:11434"));
+        settings.agent.max_steps = 3;
+        settings.appearance.reasoning = Reasoning::Expanded;
+        let fresh = settings.reset();
+        assert_eq!(fresh.models.selected, settings.models.selected);
+        assert_eq!(fresh.models.pinned, settings.models.pinned);
+        assert_eq!(fresh.models.providers, settings.models.providers);
+        assert_eq!(fresh.agent, Agent::default());
+        assert_eq!(fresh.appearance, Appearance::default());
     }
 
     #[test]
@@ -365,6 +276,17 @@ mod tests {
         let mut base = json!({ "agent": { "max_steps": 100, "access": "full" }, "tools": { "ignored": ["a", "b"] } });
         merge(&mut base, json!({ "agent": { "access": "supervised" }, "tools": { "ignored": ["c"] } }));
         assert_eq!(base, json!({ "agent": { "max_steps": 100, "access": "supervised" }, "tools": { "ignored": ["c"] } }));
+    }
+
+    #[test]
+    fn saving_keeps_what_a_newer_version_wrote() {
+        let path = std::env::temp_dir().join(format!("quill-keep-{}.json", std::process::id()));
+        fs::write(&path, r#"{ "agent": { "max_steps": 5, "later": true }, "newer": [1] }"#).unwrap();
+        let value = keep_unknown(&path, json!({ "agent": { "max_steps": 9 }, "tools": {} }));
+        assert_eq!(value, json!({ "agent": { "max_steps": 9, "later": true }, "newer": [1], "tools": {} }));
+        fs::write(&path, "{ broken").unwrap();
+        assert_eq!(keep_unknown(&path, json!({ "a": 1 })), json!({ "a": 1 }));
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -391,13 +313,11 @@ mod tests {
         let mut settings = Settings::default();
         settings.tools.shell = Shell::Cmd;
         settings.tools.disabled = vec!["shell".into()];
-        settings.agent.compact_at = 70;
         let limits = settings.limits();
         assert_eq!(limits.shell, Shell::Cmd);
         assert_eq!(limits.disabled_tools, vec!["shell".to_string()]);
-        assert!((limits.compact_at - 0.7).abs() < 0.001);
         settings.agent.auto_compact = false;
-        assert_eq!(settings.limits().compact_at, f32::MAX);
+        assert!(!settings.limits().auto_compact);
         assert_eq!(Settings::default().limits(), Limits::default());
     }
 }

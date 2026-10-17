@@ -2,17 +2,22 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use quill_providers::{ChatRequest, Error, Event as Stream, Message, Provider, StopReason, ToolCall, ToolSpec};
-use serde_json::Value;
 
 use crate::context;
 use crate::policy::{self, Access, Effect, Rule, Verdict};
 use crate::prompt::{PromptContext, system_prompt};
-use crate::protocol::{Approval, Decision, Event, Outcome, PlanStep};
+use crate::protocol::{Approval, Decision, Event, Outcome, PlanStep, Question};
 use crate::session::{Inbox, Input, Session, Sink, TurnContext};
-use crate::tools::{self, Ctx, Host, Output, Prepared, Tool};
+use crate::tools::{self, Ctx, Host, Output, Prepared, Tool, Toolset};
 
 pub(crate) const STOPPED: &str = "Stopped by the user before this ran.";
 const REFUSED: &str = "The model declined to continue with this request. Try rephrasing it, or pick another model.";
+
+const MAX_COMPACTIONS: usize = 3;
+
+const UNASKED_GIT: &str = "The user has not asked for a commit or a pull request, so leave the changes uncommitted and finish with your reply. The user commits when they choose to.";
+
+const CRAMPED: &str = "The context filled up three times in this turn, so Quill stopped compacting it. The task may need a model with a bigger context window, or smaller steps.";
 
 #[derive(Default)]
 struct Reply {
@@ -20,7 +25,6 @@ struct Reply {
     reasoning: String,
     calls: Vec<ToolCall>,
     stop: Option<StopReason>,
-    native: Option<Value>,
 }
 
 #[derive(Default)]
@@ -47,13 +51,8 @@ impl Host for CallHost<'_> {
         (self.sink)(Event::PlanUpdated { turn: self.turn, steps, explanation });
     }
 
-    fn ask(&self, question: &str, options: &[String]) -> Option<String> {
-        (self.sink)(Event::QuestionAsked {
-            turn: self.turn,
-            id: self.id.clone(),
-            question: question.to_string(),
-            options: options.to_vec(),
-        });
+    fn ask(&self, questions: &[Question]) -> Option<Vec<String>> {
+        (self.sink)(Event::QuestionAsked { turn: self.turn, id: self.id.clone(), questions: questions.to_vec() });
         self.inbox.lock().expect("inbox lock").answer(&self.id, self.cancel)
     }
 }
@@ -74,23 +73,47 @@ pub(crate) fn run(
         shell: ctx.limits.shell,
         personal: &ctx.personal,
         instructions: &ctx.instructions,
+        final_newline: ctx.limits.final_newline,
     });
     let specs: Vec<ToolSpec> = tools.iter().map(|tool| tools::spec_for(tool.as_ref())).collect();
+    let described: usize = specs.iter().map(|spec| spec.name.len() + spec.description.len() + spec.parameters.to_string().len()).sum();
+    let overhead = ((system.len() + described) / 4) as u64;
     session.take_steers();
+    session.asked_for_git = tools::asks_for_git(&input.text);
     session.push(Message::user_with_images(input.text, input.images));
+    let mut retried = false;
+    let mut floor = 0;
+    let mut compactions = 0;
+    let mut warned = false;
+    let growth = ctx.context_window.map_or(0, |window| context::limit(window) / 4);
     for _ in 0..ctx.limits.max_steps {
         if cancel.load(Ordering::Relaxed) {
             return Outcome::Stopped;
         }
         session.take_steers();
-        let used = session.used.unwrap_or_else(|| context::estimate(&session.history));
-        if !ctx.server_compaction && context::over(used, ctx.context_window, ctx.limits.compact_at) {
-            let _ = session.compact(ctx, cancel);
+        let used = session.used(overhead);
+        if ctx.limits.auto_compact && context::over(used, ctx.context_window) && used.saturating_sub(floor) > growth {
+            if compactions < MAX_COMPACTIONS {
+                compactions += usize::from(make_room(session, ctx, cancel, overhead));
+            } else if !warned {
+                warned = true;
+                session.emit(Event::CompactFailed { reason: CRAMPED.into() });
+            }
+            floor = session.used(overhead);
         }
         let reply = match step(session, turn, ctx, provider, &system, &specs, cancel) {
             Ok(reply) => reply,
-            Err(error) => return Outcome::Failed(error.0),
+            Err(error) => {
+                let again = !retried && ctx.limits.auto_compact && compactions < MAX_COMPACTIONS && context::overflowed(&error.0);
+                if !again || !compact(session, ctx, cancel) {
+                    return Outcome::Failed(error.0);
+                }
+                compactions += 1;
+                retried = true;
+                continue;
+            }
         };
+        retried = false;
         if cancel.load(Ordering::Relaxed) {
             if !reply.text.trim().is_empty() {
                 session.push(Message::assistant(reply.text, Vec::new()));
@@ -101,8 +124,7 @@ pub(crate) fn run(
         let refused = reply.stop == Some(StopReason::Refusal);
         let calls = if truncated || refused { Vec::new() } else { reply.calls };
         let content = if calls.is_empty() && reply.text.trim().is_empty() { reply.reasoning.trim().to_string() } else { reply.text };
-        let native = if refused { None } else { reply.native };
-        session.push(Message { native, ..Message::assistant(content, calls.clone()) });
+        session.push(Message::assistant(content, calls.clone()));
         if calls.is_empty() {
             if session.take_steers() {
                 continue;
@@ -123,6 +145,32 @@ pub(crate) fn run(
     Outcome::Failed(format!("Stopped after {} steps. Send a follow-up to let the agent continue.", ctx.limits.max_steps))
 }
 
+fn compact(session: &mut Session, ctx: &TurnContext, cancel: &AtomicBool) -> bool {
+    match session.compact(ctx, cancel, true) {
+        Ok(()) => true,
+        Err(reason) => {
+            if !cancel.load(Ordering::Relaxed) {
+                session.emit(Event::CompactFailed { reason });
+            }
+            false
+        }
+    }
+}
+
+fn make_room(session: &mut Session, ctx: &TurnContext, cancel: &AtomicBool, overhead: u64) -> bool {
+    let full = session.history.clone();
+    let measured = session.measured;
+    if context::trim_outputs(&mut session.history, 6) {
+        session.measured = None;
+        if !context::over(session.used(overhead), ctx.context_window) {
+            return false;
+        }
+        session.history = full;
+        session.measured = measured;
+    }
+    compact(session, ctx, cancel)
+}
+
 fn step(
     session: &mut Session,
     turn: usize,
@@ -138,11 +186,10 @@ fn step(
     let request = ChatRequest {
         model: ctx.model.clone(),
         messages,
-        thinking: ctx.thinking,
-        effort: ctx.effort,
-        max_tokens: ctx.max_output,
-        server_compaction: ctx.server_compaction,
+        reasoning: ctx.tuning.reasoning.clone(),
+        kwargs: ctx.tuning.kwargs.clone(),
         tools: specs.to_vec(),
+        context: ctx.context_window,
     };
     let sink = session.sink.clone();
     let mut reply = Reply::default();
@@ -174,11 +221,10 @@ fn step(
             used = Some(tokens.total());
             sink(Event::Usage { turn, tokens });
         }
-        Stream::Native(native) => reply.native = Some(native),
         Stream::Stop(reason) => reply.stop = Some(reason),
     })?;
-    if used.is_some() {
-        session.used = used;
+    if let Some(tokens) = used {
+        session.measured = Some((tokens, session.history.len() + 1));
     }
     let base = session.history.len();
     reply.calls = pending
@@ -286,6 +332,9 @@ fn admit(
             "The arguments were not valid JSON: {raw}. Send a JSON object, for example {{\"path\": \"src/main.rs\"}}."
         )));
     }
+    if tool.spec().toolset == Toolset::Git && !session.asked_for_git {
+        return Err(Output::fail(UNASKED_GIT));
+    }
     let root = ctx.root.as_deref().ok_or_else(|| Output::fail("No project is open, so tools are unavailable."))?;
     let cx = Ctx { root, limits: &ctx.limits, cancel, host };
     let prepared = tool.prepare(&args, &cx).map_err(Output::fail)?;
@@ -391,13 +440,10 @@ mod tests {
 
     fn context(script: Arc<Script>, root: &std::path::Path, access: Access) -> TurnContext {
         TurnContext {
-            engine: crate::session::Engine::Model(script),
+            provider: script,
             summarizer: None,
             model: "test".into(),
-            thinking: None,
-            effort: None,
-            max_output: None,
-            server_compaction: false,
+            tuning: quill_providers::Tuning::default(),
             context_window: None,
             root: Some(root.to_path_buf()),
             access,
@@ -452,7 +498,7 @@ mod tests {
         });
         assert_eq!(outcome, Outcome::Done);
         assert_eq!(ended, vec![(true, 1)]);
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "hi");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "hi\n");
         let second = &script.seen.lock().unwrap()[1];
         assert_eq!(second.messages.last().unwrap().tool_call_id.as_deref(), Some("c1"));
         let _ = std::fs::remove_dir_all(&root);
@@ -480,6 +526,35 @@ mod tests {
     }
 
     #[test]
+    fn a_full_window_is_compacted_and_the_turn_carries_on() {
+        let root = temp("compact-turn");
+        let usage = Stream::Usage(quill_providers::Tokens { prompt: 8000, completion: 10, cache_read: 0 });
+        let plan = call("c1", "update_plan", r#"{"plan":[{"step":"Write it","status":"in_progress"}]}"#);
+        let script = Script::new(vec![
+            vec![plan, usage, Stream::Stop(StopReason::ToolUse)],
+            vec![Stream::Content("They started writing it.".into())],
+            vec![Stream::Content("finished".into())],
+        ]);
+        let (handle, rx) = start(&root);
+        let input = Input { text: "write the parser".into(), images: Vec::new() };
+        let context = TurnContext { context_window: Some(9000), ..context(script.clone(), &root, Access::Full) };
+        handle.send(Op::Turn { turn: 0, input, context, cancel: Arc::default() });
+        let mut compacted = false;
+        let outcome = until_finished(&rx, |event| compacted |= matches!(event, Event::Compacted { .. }));
+        assert_eq!(outcome, Outcome::Done);
+        assert!(compacted);
+        let seen = script.seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert!(seen[1].messages[0].content.starts_with("You are compacting a coding session"));
+        let resumed = &seen[2].messages;
+        assert!(resumed[1].content.contains("They started writing it.") && resumed[1].content.contains("write the parser"));
+        assert!(resumed[1].content.contains("- [in progress] Write it"));
+        assert_eq!(resumed[2].tool_calls[0].function.name, "update_plan");
+        assert_eq!(resumed.last().unwrap().role, quill_providers::Role::Tool);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn steering_adds_a_message_before_the_next_step() {
         let root = temp("steer");
         let script = Script::new(vec![vec![call("c1", "ask_user", r#"{"question":"Which one?"}"#)], vec![Stream::Content("ok".into())]]);
@@ -490,7 +565,7 @@ mod tests {
         let outcome = until_finished(&rx, |event| {
             if let Event::QuestionAsked { id, .. } = event {
                 answerer.send(Op::Steer("use the blue one".into()));
-                answerer.send(Op::Answer { id: id.clone(), text: "the second".into() });
+                answerer.send(Op::Answer { id: id.clone(), answers: vec!["the second".into()] });
             }
         });
         assert_eq!(outcome, Outcome::Done);
@@ -520,6 +595,16 @@ mod tests {
         });
         assert_eq!(outcome, Outcome::Stopped);
         assert_eq!(tool_messages, 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compacting_with_nothing_earlier_says_why() {
+        let root = temp("compact");
+        let (handle, rx) = start(&root);
+        handle.send(Op::Compact { context: context(Script::new(Vec::new()), &root, Access::Full), cancel: Arc::default() });
+        let event = rx.recv_timeout(Duration::from_secs(20)).expect("an event");
+        assert_eq!(event, Event::CompactFailed { reason: "There is nothing to compact yet.".into() });
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -134,3 +134,23 @@ impl Tool for OpenPullRequest {
         ))
     }
 }
+
+pub fn asks_for_git(text: &str) -> bool {
+    let text = text.to_lowercase();
+    let words: Vec<&str> = text.split(|c: char| !c.is_alphanumeric()).collect();
+    ["commit", "push", "pull request"].iter().any(|word| text.contains(word)) || words.iter().any(|word| matches!(*word, "pr" | "prs"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_requests_that_mention_git_allow_commits() {
+        assert!(asks_for_git("Fix the bug and commit it"));
+        assert!(asks_for_git("open a PR for this"));
+        assert!(asks_for_git("Push my changes"));
+        assert!(!asks_for_git("Add a mute command that prints a message"));
+        assert!(!asks_for_git("improve the parser"));
+    }
+}

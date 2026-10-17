@@ -1,26 +1,21 @@
 [graph]
-targets = ["x86_64-pc-windows-msvc"]
+targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin"]
 all-features = false
 
 [licenses]
 allow = [
     "MIT",
-    "MIT-0",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
-    "BSD-2-Clause",
     "BSD-3-Clause",
     "Zlib",
-    "0BSD",
-    "CC0-1.0",
     "Unlicense",
-    "BSL-1.0",
     "Unicode-3.0",
+    "ISC",
 ]
 confidence-threshold = 0.9
 exceptions = [
-    { allow = ["MPL-2.0"], crate = "option-ext" },
-    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs" },
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
 ]
 
 [bans]

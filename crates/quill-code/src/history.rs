@@ -1,0 +1,858 @@
+use crossterm::style::{Color, Stylize};
+use quill_config::Reasoning;
+use quill_core::{Category, FileDiff, LineKind, PlanStep, StepStatus};
+
+use crate::markdown;
+use crate::text::{Line, accent, bad, bold, clean, dim, fill, good, indent, plain, shade, truncate, warn, wrap};
+use crate::thread::{Item, ToolItem, ToolStatus, Turn, TurnState, now_ms};
+use crate::usage::count;
+
+const DIFF_LINES: usize = 12;
+const OUTPUT_LINES: usize = 3;
+const FAILED_LINES: usize = 8;
+const LIVE_OUTPUT: usize = 5;
+const LIVE_TEXT: usize = 14;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Look {
+    pub width: usize,
+    pub reasoning: Reasoning,
+    pub group: bool,
+}
+
+impl Look {
+    fn inner(&self, used: usize) -> usize {
+        self.width.saturating_sub(used).max(10)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Prompt,
+    Row,
+    Prose,
+}
+
+fn hidden_tool(tool: &ToolItem) -> bool {
+    matches!(tool.category, Category::Plan | Category::Question)
+}
+
+fn blank(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
+pub fn plan(turn: &Turn) -> Option<(&[PlanStep], Option<&str>)> {
+    turn.items.iter().find_map(|item| match item {
+        Item::Plan { steps, explanation } => Some((steps.as_slice(), explanation.as_deref())),
+        _ => None,
+    })
+}
+
+fn explored(tools: &[&ToolItem]) -> String {
+    let count = |names: &[&str]| tools.iter().filter(|t| names.contains(&t.tool.as_str())).count();
+    let (reads, searches, lists) = (count(&["read_file"]), count(&["grep", "find_files"]), count(&["list_dir"]));
+    let other = tools.len() - reads - searches - lists;
+    let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut parts = Vec::new();
+    if reads > 0 {
+        parts.push(plural(reads, "file", "files"));
+    }
+    if searches > 0 {
+        parts.push(plural(searches, "search", "searches"));
+    }
+    if lists > 0 {
+        parts.push(plural(lists, "folder", "folders"));
+    }
+    if other > 0 {
+        parts.push(plural(other, "lookup", "lookups"));
+    }
+    parts.join(", ")
+}
+
+fn seconds_label(seconds: f32) -> String {
+    if seconds < 10.0 { format!("{seconds:.1}s") } else { duration(seconds.round() as u64) }
+}
+
+pub fn duration(seconds: u64) -> String {
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m {}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {}m", seconds / 3600, seconds % 3600 / 60),
+    }
+}
+
+fn command_body(output: &str) -> &str {
+    match output.split_once('\n') {
+        Some((first, rest)) if first.starts_with("Exit code") || first.starts_with("Stopped") => rest,
+        None if output.starts_with("Exit code") => "",
+        _ => output,
+    }
+}
+
+fn target(tool: &ToolItem) -> String {
+    match tool.target.trim() {
+        "" => return tool.tool.replace('_', " "),
+        "." | "./" => return "the project".into(),
+        _ => {}
+    }
+    let mut lines = tool.target.lines();
+    let first = clean(lines.next().unwrap_or_default());
+    if lines.next().is_some() { format!("{first} …") } else { first }
+}
+
+fn bubble(text: &str, look: Look) -> Vec<Line> {
+    let lines = wrap(&Line::styled(clean(text.trim()), shade(plain())), look.inner(4));
+    let lines = indent(lines, Line::styled(" › ", shade(accent())), Line::styled("   ", shade(plain())));
+    lines.into_iter().map(|line| fill(line, look.width, shade(plain()))).collect()
+}
+
+fn answer(lines: Vec<Line>, first: bool) -> Vec<Line> {
+    let mark = if first { Line::plain("● ") } else { Line::plain("  ") };
+    indent(lines, mark, Line::plain("  "))
+}
+
+pub fn prompt_lines(turn: &Turn, look: Look) -> Vec<Line> {
+    let mut lines = bubble(&turn.prompt, look);
+    let images = turn.images.iter().map(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default());
+    let names: Vec<String> = if turn.attachments.is_empty() { images.collect() } else { turn.attachments.clone() };
+    for name in names {
+        lines.push(fill(Line::styled(format!("   + {name}"), shade(dim())), look.width, shade(plain())));
+    }
+    lines
+}
+
+pub fn tool_row(tool: &ToolItem, look: Look, spinner: &str) -> Line {
+    let mut head = match tool.status {
+        ToolStatus::Running => Line::styled(format!("{spinner} "), accent()),
+        ToolStatus::Waiting => Line::styled("! ", warn()),
+        ToolStatus::Failed => Line::styled("✗ ", bad()),
+        ToolStatus::Done if tool.exit_code().is_some_and(|code| code != 0) => Line::styled("✗ ", bad()),
+        ToolStatus::Done => Line::styled("✓ ", good()),
+    };
+    head.push(format!("{} ", tool.verb()), dim());
+    let mut tail = Line::default();
+    if !tool.diffs.is_empty() {
+        tail.push(format!(" +{}", tool.diffs.iter().map(|d| d.added).sum::<usize>()), good());
+        tail.push(format!(" -{}", tool.diffs.iter().map(|d| d.removed).sum::<usize>()), bad());
+    }
+    if tool.category == Category::Command
+        && let Some(code) = tool.exit_code().filter(|code| *code != 0)
+    {
+        tail.push(format!(" · exit {code}"), bad());
+    }
+    match tool.status {
+        ToolStatus::Running => {
+            let seconds = now_ms().saturating_sub(tool.started) / 1000;
+            if seconds > 0 {
+                tail.push(format!(" · {}", duration(seconds)), dim());
+            }
+        }
+        ToolStatus::Waiting => tail.push(" · needs your OK", warn()),
+        _ => {
+            if let Some(seconds) = tool.seconds().filter(|seconds| *seconds >= 1.0) {
+                tail.push(format!(" · {}", seconds_label(seconds)), dim());
+            }
+        }
+    }
+    let room = look.width.saturating_sub(head.width() + tail.width()).max(8);
+    head.append(truncate(&Line::plain(target(tool)), room));
+    head.append(tail);
+    truncate(&head, look.width)
+}
+
+fn connect(lines: Vec<Line>, look: Look) -> Vec<Line> {
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let mut row = if index == 0 { Line::styled("  ⎿  ", dim()) } else { Line::plain("     ") };
+            row.append(line);
+            truncate(&row, look.width)
+        })
+        .collect()
+}
+
+fn output_lines(text: &str, limit: usize, from_end: bool, style: crossterm::style::ContentStyle) -> Vec<Line> {
+    let all: Vec<&str> = text.trim_end().lines().collect();
+    if all.iter().all(|line| blank(line)) {
+        return Vec::new();
+    }
+    let hidden = all.len().saturating_sub(limit);
+    let mut lines = Vec::new();
+    if from_end && hidden > 0 {
+        lines.push(Line::styled(format!("… {hidden} earlier lines"), dim()));
+    }
+    let shown = if from_end { &all[hidden..] } else { &all[..all.len().min(limit)] };
+    lines.extend(shown.iter().map(|line| Line::styled(*line, style)));
+    if !from_end && hidden > 0 {
+        lines.push(Line::styled(format!("… {hidden} more lines"), dim()));
+    }
+    lines
+}
+
+fn plural(count: usize, word: &str) -> String {
+    if count == 1 { format!("{count} {word}") } else { format!("{count} {word}s") }
+}
+
+fn changed(added: usize, removed: usize) -> String {
+    match (added, removed) {
+        (0, removed) => format!("Removed {}", plural(removed, "line")),
+        (added, 0) => format!("Added {}", plural(added, "line")),
+        (added, removed) => format!("Added {}, removed {}", plural(added, "line"), plural(removed, "line")),
+    }
+}
+
+pub fn diff_lines(diff: &FileDiff, limit: usize, look: Look) -> Vec<Line> {
+    let mut lines = Vec::new();
+    let room = look.width.saturating_sub(5);
+    for line in diff.lines.iter().take(limit) {
+        let (number, sign, style) = match line.kind {
+            LineKind::Added => (line.new, "+", Some(Color::AnsiValue(22))),
+            LineKind::Removed => (line.old, "-", Some(Color::AnsiValue(52))),
+            LineKind::Context => (line.new, " ", None),
+            LineKind::Gap => {
+                lines.push(Line::styled("     ⋯", dim()));
+                continue;
+            }
+            LineKind::Note => {
+                lines.push(Line::styled(format!("          {}", line.text), dim()));
+                continue;
+            }
+        };
+        let number = number.map(|n| n.to_string()).unwrap_or_default();
+        let row = match style {
+            Some(color) => {
+                let shaded = plain().with(Color::White).on(color);
+                let row = Line::styled(format!("{number:>4} "), shaded.dim()).with(format!("{sign} {}", clean(&line.text)), shaded);
+                fill(truncate(&row, room), room, shaded)
+            }
+            None => truncate(&Line::styled(format!("{number:>4} "), dim()).with(format!("  {}", clean(&line.text)), dim()), room),
+        };
+        lines.push(Line::plain("     ").with_line(row));
+    }
+    if diff.lines.len() > limit {
+        lines.push(Line::styled(format!("     … {} more lines, /diff shows them all", diff.lines.len() - limit), dim()));
+    }
+    lines
+}
+
+pub fn tool_body(tool: &ToolItem, look: Look) -> Vec<Line> {
+    if !tool.diffs.is_empty() {
+        let added: usize = tool.diffs.iter().map(|diff| diff.added).sum();
+        let removed: usize = tool.diffs.iter().map(|diff| diff.removed).sum();
+        let mut lines = connect(vec![Line::styled(changed(added, removed), dim())], look);
+        for diff in &tool.diffs {
+            if tool.diffs.len() > 1 {
+                lines.push(Line::styled(format!("     {}", diff.path), dim()));
+            }
+            lines.extend(diff_lines(diff, DIFF_LINES, look));
+        }
+        return lines;
+    }
+    let output = clean(&tool.output);
+    let failed = tool.status == ToolStatus::Failed;
+    match tool.category {
+        Category::Command => {
+            let failed = failed || tool.exit_code().is_some_and(|code| code != 0);
+            let body = command_body(&output);
+            let lines =
+                if failed { output_lines(body, FAILED_LINES, true, plain()) } else { output_lines(body, OUTPUT_LINES, true, dim()) };
+            connect(lines, look)
+        }
+        _ if failed => connect(output_lines(&output, 3, false, bad()), look),
+        Category::Explore | Category::Edit => Vec::new(),
+        _ => connect(output_lines(&output, 2, false, dim()), look),
+    }
+}
+
+pub fn running_command(tool: &ToolItem, look: Look) -> Vec<Line> {
+    let output = clean(&tool.output);
+    let body = command_body(&output);
+    let count = body.trim_end().lines().count();
+    let seconds = now_ms().saturating_sub(tool.started) / 1000;
+    let command = clean(tool.target.lines().next().unwrap_or_default());
+    let status = format!(" ({} · {})", duration(seconds), plural(count, "line"));
+    let room = look.width.saturating_sub(7 + status.chars().count()).max(8);
+    let mut first = Line::styled("$ ", dim());
+    first.append(truncate(&Line::plain(command), room));
+    first.push(status, dim());
+    let mut lines = vec![first];
+    lines.extend(output_lines(body, LIVE_OUTPUT, true, dim()));
+    connect(lines, look)
+}
+
+fn explore_span(items: &[Item], start: usize) -> (usize, usize) {
+    let mut end = start;
+    for (index, item) in items.iter().enumerate().skip(start) {
+        match item {
+            Item::Tool(tool) if hidden_tool(tool) => {}
+            Item::Tool(tool) if tool.category == Category::Explore => end = index + 1,
+            Item::Text(text) | Item::Reasoning(text) if blank(text) => {}
+            _ => return (end, index),
+        }
+    }
+    (end, items.len())
+}
+
+fn explore_tools(items: &[Item]) -> Vec<&ToolItem> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Tool(tool) if !hidden_tool(tool) && tool.category == Category::Explore => Some(tool),
+            _ => None,
+        })
+        .collect()
+}
+
+pub fn explore_row(tools: &[&ToolItem], look: Look, spinner: &str) -> Line {
+    let working = tools.iter().any(|t| t.working());
+    let failed = tools.iter().filter(|t| t.status == ToolStatus::Failed).count();
+    let mut line = if working { Line::styled(format!("{spinner} "), accent()) } else { Line::styled("✓ ", good()) };
+    line.push(if working { "Exploring " } else { "Explored " }, dim());
+    line.push(explored(tools), plain());
+    if failed > 0 {
+        line.push(format!(" ({failed} failed)"), bad());
+    }
+    let targets: Vec<String> = tools.iter().map(|tool| target(tool)).collect();
+    line.push(format!(" · {}", targets.join(", ")), dim());
+    truncate(&line, look.width)
+}
+
+fn unmarked(line: &str) -> String {
+    let line = line.replace(['*', '`', '#'], "");
+    let line = line.trim().trim_start_matches(['-', '•']).trim_start();
+    let digits = line.chars().take_while(char::is_ascii_digit).count();
+    let line = match line[digits..].strip_prefix(['.', ')']) {
+        Some(rest) if digits > 0 => rest,
+        _ => line,
+    };
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn sentences(text: &str) -> (Vec<String>, String) {
+    let text = clean(text);
+    let mut done = Vec::new();
+    let mut rest = String::new();
+    let lines: Vec<&str> = text.split('\n').collect();
+    for (index, line) in lines.iter().enumerate() {
+        let line = unmarked(line);
+        let mut start = 0;
+        for (at, c) in line.char_indices() {
+            if matches!(c, '.' | '!' | '?' | ':') && line[at + 1..].starts_with(' ') {
+                done.push(line[start..=at].trim().to_string());
+                start = at + 1;
+            }
+        }
+        let tail = line[start..].trim().to_string();
+        if index + 1 < lines.len() {
+            done.extend(Some(tail).filter(|tail| !tail.is_empty()));
+        } else {
+            rest = tail;
+        }
+    }
+    (done, rest)
+}
+
+pub fn summary(text: &str) -> Option<String> {
+    sentences(text).0.pop()
+}
+
+fn last_sentence(text: &str) -> String {
+    let (mut done, rest) = sentences(text);
+    if !rest.is_empty() {
+        done.push(rest);
+    }
+    done.pop().unwrap_or_default()
+}
+
+fn reasoning_lines(text: &str, look: Look) -> Vec<Line> {
+    let text = clean(text.trim());
+    if blank(&text) {
+        return Vec::new();
+    }
+    match look.reasoning {
+        Reasoning::Hidden => Vec::new(),
+        Reasoning::Collapsed => {
+            vec![truncate(&Line::styled("◇ Thought ", dim()).with(last_sentence(&text), dim().italic()), look.width)]
+        }
+        Reasoning::Expanded => {
+            let mut lines = vec![Line::styled("◇ Thought", dim())];
+            lines.extend(indent(wrap(&Line::styled(text, dim().italic()), look.inner(2)), Line::plain("  "), Line::plain("  ")));
+            lines
+        }
+    }
+}
+
+pub fn plan_lines(steps: &[PlanStep], explanation: Option<&str>, look: Look) -> Vec<Line> {
+    let done = steps.iter().filter(|step| step.status == StepStatus::Done).count();
+    let mut lines = vec![Line::styled("Plan", bold()).with(format!(" · {done} of {} done", steps.len()), dim())];
+    for step in steps {
+        let (mark, mark_style, style) = match step.status {
+            StepStatus::Done => ("✓ ", good(), dim()),
+            StepStatus::Active => ("› ", accent(), bold()),
+            StepStatus::Pending => ("○ ", dim(), plain()),
+        };
+        let text = wrap(&Line::styled(clean(&step.text), style), look.inner(4));
+        lines.extend(indent(text, Line::plain("  ").with(mark, mark_style), Line::plain("    ")));
+    }
+    if let Some(explanation) = explanation.filter(|text| !blank(text)) {
+        lines.extend(indent(wrap(&Line::styled(clean(explanation), dim()), look.inner(2)), Line::plain("  "), Line::plain("  ")));
+    }
+    lines
+}
+
+fn question_lines(question: &str, answer: Option<&str>, look: Look) -> Vec<Line> {
+    let mut lines = indent(wrap(&Line::styled(clean(question), bold()), look.inner(2)), Line::styled("? ", accent()), Line::plain("  "));
+    match answer {
+        Some(answer) => lines.extend(bubble(answer, look)),
+        None => lines.push(Line::styled("  Not answered", dim())),
+    }
+    lines
+}
+
+fn steer_lines(text: &str, look: Look) -> Vec<Line> {
+    let mut lines = bubble(text, look);
+    lines.push(Line::styled("   added while working", dim()));
+    lines
+}
+
+fn note_lines(text: &str, look: Look) -> Vec<Line> {
+    indent(wrap(&Line::styled(clean(text), dim()), look.inner(2)), Line::styled("· ", dim()), Line::plain("  "))
+}
+
+fn footer(turn: &Turn) -> Line {
+    let millis = turn.worked_ms.unwrap_or_else(|| now_ms().saturating_sub(turn.started));
+    let mut parts = vec![format!("Worked for {}", seconds_label(millis as f32 / 1000.0))];
+    parts.extend(turn.model.clone());
+    if turn.usage.total() > 0 {
+        parts.push(format!("{} tokens", count(turn.usage.total())));
+    }
+    Line::styled(format!("  {}", parts.join(" · ")), dim())
+}
+
+pub fn ending_lines(turn: &Turn, look: Look) -> Vec<Line> {
+    let mut lines = Vec::new();
+    match &turn.state {
+        TurnState::Stopped => lines.push(Line::styled("■ You stopped this reply", dim())),
+        TurnState::Failed(error) => {
+            lines.extend(indent(wrap(&Line::styled(clean(error), bad()), look.inner(2)), Line::styled("✗ ", bad()), Line::plain("  ")))
+        }
+        _ => {}
+    }
+    let changes = turn.changes();
+    if !changes.is_empty() {
+        let added: usize = changes.iter().map(|change| change.added).sum();
+        let removed: usize = changes.iter().map(|change| change.removed).sum();
+        let files = if changes.len() == 1 { "file" } else { "files" };
+        lines.push(
+            Line::styled(format!("{} {files} changed", changes.len()), bold())
+                .with(format!(" +{added}"), good())
+                .with(format!(" -{removed}"), bad()),
+        );
+        for change in &changes {
+            let mut line = Line::plain(format!("  {}", change.path))
+                .with(format!(" +{}", change.added), good())
+                .with(format!(" -{}", change.removed), bad());
+            if change.created {
+                line.push(" new", dim());
+            }
+            lines.push(truncate(&line, look.width));
+        }
+    }
+    lines.push(truncate(&footer(turn), look.width));
+    lines
+}
+
+pub fn activity(turn: &Turn, waiting: bool, asked: bool) -> String {
+    if asked {
+        return "Waiting for your answer".into();
+    }
+    if waiting {
+        return "Waiting for your OK".into();
+    }
+    match turn.items.iter().rev().find(|item| !matches!(item, Item::Plan { .. } | Item::Note(_) | Item::Steer(_))) {
+        None => "Warming up the model".into(),
+        Some(Item::Reasoning(_)) => "Thinking".into(),
+        Some(Item::Text(_)) => "Writing".into(),
+        Some(Item::Tool(tool)) if tool.working() && !hidden_tool(tool) => "Working".into(),
+        _ => "Processing".into(),
+    }
+}
+
+pub fn writing(turn: &Turn) -> bool {
+    matches!(activity(turn, false, false).as_str(), "Writing" | "Working")
+}
+
+pub fn plan_progress(turn: &Turn, look: Look) -> Option<Line> {
+    let (steps, _) = plan(turn)?;
+    let done = steps.iter().filter(|step| step.status == StepStatus::Done).count();
+    let next = steps
+        .iter()
+        .find(|step| step.status == StepStatus::Active)
+        .or_else(|| steps.iter().find(|step| step.status == StepStatus::Pending));
+    let mut line = Line::styled(format!("Plan {done}/{}", steps.len()), dim());
+    if let Some(step) = next {
+        line.push(format!(" · {}", clean(&step.text)), plain());
+    }
+    Some(truncate(&line, look.width))
+}
+
+fn settled(text: &str, from: usize) -> usize {
+    let mut fence = false;
+    let mut cut = from;
+    let mut position = from;
+    for line in text[from..].split_inclusive('\n') {
+        position += line.len();
+        if !line.ends_with('\n') {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fence = !fence;
+        } else if trimmed.is_empty() && !fence {
+            cut = position;
+        }
+    }
+    cut
+}
+
+pub fn turn_lines(turn: &Turn, look: Look) -> Vec<Line> {
+    let mut lines = vec![Line::default()];
+    lines.extend(prompt_lines(turn, look));
+    lines.extend(Progress::new().advance(turn, look));
+    lines
+}
+
+pub struct Progress {
+    item: usize,
+    offset: usize,
+    plan: Option<Vec<PlanStep>>,
+    last: Option<Kind>,
+    done: bool,
+}
+
+impl Progress {
+    pub fn new() -> Progress {
+        Progress { item: 0, offset: 0, plan: None, last: Some(Kind::Prompt), done: false }
+    }
+
+    pub fn done(&self) -> bool {
+        self.done
+    }
+
+    fn block(&mut self, out: &mut Vec<Line>, kind: Kind, lines: Vec<Line>) {
+        if lines.is_empty() {
+            return;
+        }
+        if self.last.is_some_and(|last| kind == Kind::Prose || last != Kind::Row) {
+            out.push(Line::default());
+        }
+        out.extend(lines);
+        self.last = Some(kind);
+    }
+
+    pub fn advance(&mut self, turn: &Turn, look: Look) -> Vec<Line> {
+        let mut out = Vec::new();
+        if self.done {
+            return out;
+        }
+        let working = turn.working();
+        while self.item < turn.items.len() {
+            let streaming = working && self.item + 1 == turn.items.len();
+            match &turn.items[self.item] {
+                Item::Text(text) => {
+                    let end = if streaming { settled(text, self.offset) } else { text.len() };
+                    if end > self.offset {
+                        let chunk = &text[self.offset..end];
+                        if !blank(chunk) {
+                            let first = blank(&text[..self.offset]);
+                            self.block(&mut out, Kind::Prose, answer(markdown::render(chunk, look.inner(2)), first));
+                        }
+                        self.offset = end;
+                    }
+                    if streaming {
+                        break;
+                    }
+                }
+                Item::Reasoning(text) => {
+                    if streaming {
+                        break;
+                    }
+                    self.block(&mut out, Kind::Row, reasoning_lines(text, look));
+                }
+                Item::Tool(tool) if hidden_tool(tool) => {}
+                Item::Tool(tool) if look.group && tool.category == Category::Explore => {
+                    let (end, scanned) = explore_span(&turn.items, self.item);
+                    let tools = explore_tools(&turn.items[self.item..end]);
+                    let closed = scanned < turn.items.len() || !working;
+                    if !closed || tools.iter().any(|tool| tool.working()) {
+                        break;
+                    }
+                    self.block(&mut out, Kind::Row, vec![explore_row(&tools, look, "•")]);
+                    self.item = end;
+                    self.offset = 0;
+                    continue;
+                }
+                Item::Tool(tool) => {
+                    if tool.working() {
+                        break;
+                    }
+                    let mut lines = vec![tool_row(tool, look, "•")];
+                    lines.extend(tool_body(tool, look));
+                    self.block(&mut out, Kind::Row, lines);
+                }
+                Item::Plan { steps, explanation } => {
+                    if self.plan.as_ref() != Some(steps) {
+                        self.block(&mut out, Kind::Prose, plan_lines(steps, explanation.as_deref(), look));
+                        self.plan = Some(steps.clone());
+                    }
+                }
+                Item::Question { question, answer, .. } => {
+                    if answer.is_none() && working {
+                        break;
+                    }
+                    self.block(&mut out, Kind::Prose, question_lines(question, answer.as_deref(), look));
+                }
+                Item::Steer(text) => self.block(&mut out, Kind::Prose, steer_lines(text, look)),
+                Item::Note(text) => self.block(&mut out, Kind::Row, note_lines(text, look)),
+            }
+            self.item += 1;
+            self.offset = 0;
+        }
+        if !working && self.item >= turn.items.len() {
+            if let Some((steps, explanation)) = plan(turn)
+                && self.plan.as_deref() != Some(steps)
+            {
+                self.block(&mut out, Kind::Prose, plan_lines(steps, explanation, look));
+            }
+            self.block(&mut out, Kind::Prose, ending_lines(turn, look));
+            self.done = true;
+        }
+        out
+    }
+
+    pub fn live(&self, turn: &Turn, look: Look, spinner: &str, thought: Option<&str>) -> Vec<Line> {
+        let mut lines = Vec::new();
+        let mut index = self.item;
+        while index < turn.items.len() {
+            match &turn.items[index] {
+                Item::Text(text) => {
+                    let start = if index == self.item { self.offset.min(text.len()) } else { 0 };
+                    let rest = &text[start..];
+                    if !blank(rest) {
+                        if lines.is_empty() && self.last.is_some() {
+                            lines.push(Line::default());
+                        }
+                        let rendered = answer(markdown::render(rest, look.inner(2)), blank(&text[..start]));
+                        let skip = rendered.len().saturating_sub(LIVE_TEXT);
+                        lines.extend(rendered.into_iter().skip(skip));
+                    }
+                }
+                Item::Reasoning(text) if index + 1 < turn.items.len() => lines.extend(reasoning_lines(text, look)),
+                Item::Reasoning(text) => match look.reasoning {
+                    Reasoning::Hidden => {}
+                    Reasoning::Collapsed => {
+                        lines.push(Line::styled("◇ Thinking", dim()));
+                        if let Some(thought) = thought {
+                            let wrapped = wrap(&Line::styled(thought, dim().italic()), look.inner(2));
+                            lines.extend(indent(wrapped.into_iter().take(2).collect(), Line::plain("  "), Line::plain("  ")));
+                        }
+                    }
+                    Reasoning::Expanded => {
+                        let text = clean(text.trim());
+                        let tail: Vec<&str> = text.lines().filter(|line| !blank(line)).collect();
+                        lines.push(Line::styled("◇ Thinking", dim()));
+                        for line in &tail[tail.len().saturating_sub(6)..] {
+                            lines.push(truncate(&Line::styled(format!("  {}", line.trim()), dim().italic()), look.width));
+                        }
+                    }
+                },
+                Item::Tool(tool) if hidden_tool(tool) => {}
+                Item::Tool(tool) if look.group && tool.category == Category::Explore => {
+                    let (end, _) = explore_span(&turn.items, index);
+                    lines.push(explore_row(&explore_tools(&turn.items[index..end]), look, spinner));
+                    index = end;
+                    continue;
+                }
+                Item::Tool(tool) => {
+                    lines.push(tool_row(tool, look, spinner));
+                    if tool.status == ToolStatus::Running && tool.category == Category::Command {
+                        lines.extend(running_command(tool, look));
+                    } else if !tool.working() {
+                        lines.extend(tool_body(tool, look));
+                    }
+                }
+                Item::Steer(text) => lines.extend(steer_lines(text, look)),
+                Item::Note(text) => lines.extend(note_lines(text, look)),
+                Item::Plan { .. } | Item::Question { .. } => {}
+            }
+            index += 1;
+        }
+        lines
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quill_core::diff_text;
+    use quill_core::tools::legacy;
+
+    fn look() -> Look {
+        Look { width: 60, reasoning: Reasoning::Collapsed, group: true }
+    }
+
+    fn tool(id: &str, name: &str, target: &str, status: ToolStatus) -> Item {
+        let mut item = ToolItem::new(legacy(name));
+        item.id = id.into();
+        item.target = target.into();
+        item.status = status;
+        Item::Tool(item)
+    }
+
+    fn texts(lines: &[Line]) -> Vec<String> {
+        lines.iter().map(Line::text).collect()
+    }
+
+    #[test]
+    fn streamed_text_commits_whole_paragraphs() {
+        let mut turn = Turn::new("p".into(), Vec::new());
+        let mut progress = Progress::new();
+        turn.push_text("First paragraph.\n\nSecond is still");
+        assert_eq!(texts(&progress.advance(&turn, look())), vec!["", "● First paragraph."]);
+        assert_eq!(texts(&progress.live(&turn, look(), "*", None)), vec!["", "  Second is still"]);
+        turn.push_text(" coming.");
+        assert!(progress.advance(&turn, look()).is_empty());
+        turn.finish(TurnState::Done);
+        let rest = texts(&progress.advance(&turn, look()));
+        assert_eq!(rest[..2], ["".to_string(), "  Second is still coming.".to_string()]);
+        assert!(rest.last().unwrap().starts_with("  Worked for"));
+        assert!(progress.done());
+    }
+
+    #[test]
+    fn code_fences_hold_back_until_closed() {
+        let mut turn = Turn::new("p".into(), Vec::new());
+        let mut progress = Progress::new();
+        turn.push_text("```\nfn main() {}\n\nmore\n");
+        assert!(progress.advance(&turn, look()).is_empty());
+        turn.push_text("```\n\nAfter.");
+        assert_eq!(texts(&progress.advance(&turn, look())), vec!["", "● │ fn main() {}", "  │ ", "  │ more"]);
+    }
+
+    #[test]
+    fn exploration_groups_wait_for_the_run_to_end() {
+        let mut turn = Turn::new("p".into(), Vec::new());
+        let mut progress = Progress::new();
+        turn.items.push(tool("1", "read_file", "src/a.rs", ToolStatus::Done));
+        turn.items.push(tool("2", "grep", "TODO", ToolStatus::Running));
+        assert!(progress.advance(&turn, look()).is_empty());
+        assert!(texts(&progress.live(&turn, look(), "*", None))[0].starts_with("* Exploring 1 file, 1 search · src/a.rs, TODO"));
+        if let Item::Tool(grep) = &mut turn.items[1] {
+            grep.status = ToolStatus::Done;
+        }
+        assert!(progress.advance(&turn, look()).is_empty());
+        turn.items.push(tool("3", "shell", "cargo test", ToolStatus::Running));
+        assert_eq!(texts(&progress.advance(&turn, look())), vec!["", "✓ Explored 1 file, 1 search · src/a.rs, TODO"]);
+        assert_eq!(texts(&progress.live(&turn, look(), "*", None)), vec!["* Running cargo test", "  ⎿  $ cargo test (0s · 0 lines)"]);
+    }
+
+    #[test]
+    fn edits_show_their_diff() {
+        let mut turn = Turn::new("p".into(), Vec::new());
+        let mut item = ToolItem::new(legacy("write_file"));
+        item.id = "1".into();
+        item.target = "a.py".into();
+        item.status = ToolStatus::Done;
+        item.diffs = vec![diff_text("a.py", Some("x\n"), "y\n")];
+        turn.items.push(Item::Tool(item));
+        turn.finish(TurnState::Done);
+        let lines = texts(&Progress::new().advance(&turn, look()));
+        assert_eq!(lines[1], "✓ Wrote a.py +1 -1");
+        assert_eq!(lines[2], "  ⎿  Added 1 line, removed 1 line");
+        assert_eq!(lines[3].trim(), "1 - x");
+        assert_eq!(lines[4].trim(), "1 + y");
+        assert!(lines.iter().any(|line| line == "1 file changed +1 -1"));
+    }
+
+    #[test]
+    fn failed_commands_show_their_tail() {
+        let mut turn = Turn::new("p".into(), Vec::new());
+        let mut item = ToolItem::new(legacy("shell"));
+        item.id = "1".into();
+        item.target = "cargo test".into();
+        item.status = ToolStatus::Done;
+        item.output = "Exit code 101\nerror: one\nerror: two".into();
+        turn.items.push(Item::Tool(item));
+        turn.finish(TurnState::Done);
+        let lines = texts(&Progress::new().advance(&turn, look()));
+        assert_eq!(lines[1], "✗ Ran cargo test · exit 101");
+        assert_eq!(lines[2..4], ["  ⎿  error: one".to_string(), "     error: two".to_string()]);
+    }
+
+    #[test]
+    fn stopped_and_failed_turns_say_so() {
+        let mut stopped = Turn::new("p".into(), Vec::new());
+        stopped.finish(TurnState::Stopped);
+        assert!(texts(&ending_lines(&stopped, look())).contains(&"■ You stopped this reply".to_string()));
+        let mut failed = Turn::new("p".into(), Vec::new());
+        failed.finish(TurnState::Failed("Nothing is answering".into()));
+        assert_eq!(texts(&ending_lines(&failed, look()))[0], "✗ Nothing is answering");
+    }
+
+    #[test]
+    fn plans_print_when_they_first_appear_and_when_they_change() {
+        let mut turn = Turn::new("p".into(), Vec::new());
+        let mut progress = Progress::new();
+        let step = |status| vec![PlanStep { text: "Write it".into(), status }];
+        turn.set_plan(step(StepStatus::Active), None);
+        turn.push_text("working");
+        let first = texts(&progress.advance(&turn, look()));
+        assert_eq!(first[1..], ["Plan · 0 of 1 done".to_string(), "  › Write it".to_string()]);
+        turn.set_plan(step(StepStatus::Done), None);
+        turn.finish(TurnState::Done);
+        let last = texts(&progress.advance(&turn, look()));
+        assert!(last.contains(&"Plan · 1 of 1 done".to_string()));
+        assert_eq!(texts(&progress.advance(&turn, look())), Vec::<String>::new());
+    }
+
+    #[test]
+    fn reasoning_follows_the_setting() {
+        let mut turn = Turn::new("p".into(), Vec::new());
+        turn.push_reasoning("Let me look.\nChecking the tests.");
+        turn.push_text("Done.");
+        turn.finish(TurnState::Done);
+        let collapsed = texts(&Progress::new().advance(&turn, look()));
+        assert_eq!(collapsed[1], "◇ Thought Checking the tests.");
+        let hidden = texts(&Progress::new().advance(&turn, Look { reasoning: Reasoning::Hidden, ..look() }));
+        assert_eq!(hidden[1], "● Done.");
+    }
+
+    #[test]
+    fn thoughts_are_summarised_by_whole_sentences() {
+        assert_eq!(summary("Let me look at **main.rs**. Then I will"), Some("Let me look at main.rs.".into()));
+        assert_eq!(summary("Still going"), None);
+        assert_eq!(last_sentence("First one. Second one"), "Second one");
+        assert_eq!(summary("Facts:\n1. Foxes rest at 110 bpm\n2. They"), Some("Foxes rest at 110 bpm".into()));
+    }
+
+    #[test]
+    fn activity_names_what_is_happening() {
+        let mut turn = Turn::new("p".into(), Vec::new());
+        assert_eq!(activity(&turn, false, false), "Warming up the model");
+        turn.push_reasoning("hm");
+        assert_eq!(activity(&turn, false, false), "Thinking");
+        turn.items.push(tool("1", "shell", "ls", ToolStatus::Running));
+        assert_eq!(activity(&turn, false, false), "Working");
+        assert_eq!(activity(&turn, true, false), "Waiting for your OK");
+    }
+
+    #[test]
+    fn durations_read_naturally() {
+        assert_eq!(duration(42), "42s");
+        assert_eq!(duration(125), "2m 5s");
+        assert_eq!(duration(3720), "1h 2m");
+        assert_eq!(seconds_label(2.34), "2.3s");
+        assert_eq!(command_body("Exit code 0\nhello"), "hello");
+    }
+}

@@ -29,6 +29,12 @@ pub struct ToolView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Question {
+    pub question: String,
+    pub options: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Approval {
     pub title: String,
     pub subject: String,
@@ -63,12 +69,6 @@ pub struct PlanStep {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClaudeLink {
-    pub session: String,
-    pub synced: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", content = "error", rename_all = "snake_case")]
 pub enum Outcome {
     Done,
@@ -86,15 +86,13 @@ pub enum Event {
     ToolOutput { turn: usize, id: String, chunk: String },
     ToolEnd { turn: usize, id: String, ok: bool, output: String, diffs: Vec<FileDiff>, image: Option<String> },
     ApprovalRequested { turn: usize, id: String, approval: Approval },
-    QuestionAsked { turn: usize, id: String, question: String, options: Vec<String> },
+    QuestionAsked { turn: usize, id: String, questions: Vec<Question> },
     PlanUpdated { turn: usize, steps: Vec<PlanStep>, explanation: Option<String> },
     Message { message: Message },
+    Compacting,
     Compacted { history: Vec<Message> },
+    CompactFailed { reason: String },
     Usage { turn: usize, tokens: Tokens },
-    Cost { turn: usize, usd: f64 },
-    ContextWindow { tokens: u64 },
-    ModelResolved { turn: usize, model: String },
-    ClaudeSession { link: ClaudeLink },
     TurnFinished { turn: usize, outcome: Outcome },
 }
 

@@ -3,10 +3,11 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 authors = ["Smoffyy"]
+repository = "https://github.com/Smoffyy/quill-code"
 publish = false
 
 [workspace.dependencies]
@@ -15,7 +16,6 @@ quill-core = { path = "crates/quill-core" }
 quill-git = { path = "crates/quill-git" }
 quill-providers = { path = "crates/quill-providers" }
 quill-weave = { path = "crates/quill-weave" }
-gpui-kit = "0.7.3"
 
 [profile.dev.package."*"]
 opt-level = 2

@@ -5,35 +5,28 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use quill_providers::{Effort, Message, Provider};
+use quill_providers::{Message, Provider, Tuning};
 
-use crate::claude_code::{self, ClaudeCode};
+use crate::context;
 use crate::options::{Limits, Toolsets};
 use crate::policy::{Access, Rule};
-use crate::protocol::{ClaudeLink, Decision, Event, Outcome};
+use crate::protocol::{Decision, Event, Outcome};
+use crate::tools;
 use crate::turn;
-
-#[derive(Clone)]
-pub enum Engine {
-    Model(Arc<dyn Provider>),
-    ClaudeCode(ClaudeCode),
-}
 
 #[derive(Clone)]
 pub struct Summarizer {
     pub provider: Arc<dyn Provider>,
     pub model: String,
+    pub tuning: Tuning,
 }
 
 #[derive(Clone)]
 pub struct TurnContext {
-    pub engine: Engine,
+    pub provider: Arc<dyn Provider>,
     pub summarizer: Option<Summarizer>,
     pub model: String,
-    pub thinking: Option<bool>,
-    pub effort: Option<Effort>,
-    pub max_output: Option<u64>,
-    pub server_compaction: bool,
+    pub tuning: Tuning,
     pub context_window: Option<u64>,
     pub root: Option<PathBuf>,
     pub access: Access,
@@ -53,7 +46,7 @@ pub enum Op {
     Turn { turn: usize, input: Input, context: TurnContext, cancel: Arc<AtomicBool> },
     Steer(String),
     Decide { id: String, decision: Decision },
-    Answer { id: String, text: String },
+    Answer { id: String, answers: Vec<String> },
     Compact { context: TurnContext, cancel: Arc<AtomicBool> },
     Shutdown,
 }
@@ -86,9 +79,8 @@ pub fn spawn(history: Vec<Message>, sink: impl Fn(Event) + Send + Sync + 'static
         sink: Arc::new(sink),
         rules: Mutex::new(Vec::new()),
         raised: AtomicBool::new(false),
-        used: None,
-        claude: None,
-        link: None,
+        measured: None,
+        asked_for_git: false,
     };
     std::thread::Builder::new().name("quill-session".into()).spawn(move || session.run()).expect("start a session thread");
     SessionHandle { ops }
@@ -99,7 +91,7 @@ pub(crate) struct Inbox {
     queue: VecDeque<Op>,
     steers: Vec<String>,
     decisions: HashMap<String, Decision>,
-    answers: HashMap<String, String>,
+    answers: HashMap<String, Vec<String>>,
     closed: bool,
 }
 
@@ -110,8 +102,8 @@ impl Inbox {
             Op::Decide { id, decision } => {
                 self.decisions.insert(id, decision);
             }
-            Op::Answer { id, text } => {
-                self.answers.insert(id, text);
+            Op::Answer { id, answers } => {
+                self.answers.insert(id, answers);
             }
             Op::Shutdown => self.closed = true,
             other => return Some(other),
@@ -156,7 +148,7 @@ impl Inbox {
         self.wait(cancel, |inbox| inbox.decisions.remove(id)).unwrap_or(Decision::Decline)
     }
 
-    pub fn answer(&mut self, id: &str, cancel: &AtomicBool) -> Option<String> {
+    pub fn answer(&mut self, id: &str, cancel: &AtomicBool) -> Option<Vec<String>> {
         self.wait(cancel, |inbox| inbox.answers.remove(id))
     }
 
@@ -184,9 +176,8 @@ pub(crate) struct Session {
     pub sink: Sink,
     pub rules: Mutex<Vec<Rule>>,
     pub raised: AtomicBool,
-    pub used: Option<u64>,
-    pub claude: Option<claude_code::Process>,
-    pub link: Option<ClaudeLink>,
+    pub measured: Option<(u64, usize)>,
+    pub asked_for_git: bool,
 }
 
 impl Session {
@@ -196,15 +187,14 @@ impl Session {
             match op {
                 Some(Op::Turn { turn, input, context, cancel }) => {
                     self.emit(Event::TurnStarted { turn });
-                    let outcome = match &context.engine {
-                        Engine::Model(provider) => turn::run(&mut self, turn, input, &context, provider.as_ref(), &cancel),
-                        Engine::ClaudeCode(claude) => claude_code::run(&mut self, turn, input, &context, claude, &cancel),
-                    };
+                    let outcome = turn::run(&mut self, turn, input, &context, context.provider.as_ref(), &cancel);
                     let outcome = if cancel.load(Ordering::Relaxed) && outcome == Outcome::Done { Outcome::Stopped } else { outcome };
                     self.emit(Event::TurnFinished { turn, outcome });
                 }
                 Some(Op::Compact { context, cancel }) => {
-                    let _ = self.compact(&context, &cancel);
+                    if let Err(reason) = self.compact(&context, &cancel, false) {
+                        self.emit(Event::CompactFailed { reason });
+                    }
                 }
                 Some(_) => {}
                 None => break,
@@ -224,40 +214,38 @@ impl Session {
     pub fn take_steers(&mut self) -> bool {
         let steers = self.inbox.lock().expect("inbox lock").steers();
         let any = !steers.is_empty();
+        self.asked_for_git |= steers.iter().any(|text| tools::asks_for_git(text));
         for text in steers {
             self.push(Message::user(text));
         }
         any
     }
 
-    pub fn compact(&mut self, ctx: &TurnContext, cancel: &AtomicBool) -> Result<(), String> {
-        let Engine::Model(provider) = &ctx.engine else {
-            return Err("Claude Code keeps its own context and compacts it when it needs to.".into());
+    pub fn used(&self, overhead: u64) -> u64 {
+        match self.measured {
+            Some((tokens, at)) if at <= self.history.len() => tokens + context::estimate(&self.history[at..]),
+            _ => context::estimate(&self.history) + overhead,
+        }
+    }
+
+    pub fn compact(&mut self, ctx: &TurnContext, cancel: &AtomicBool, mid_turn: bool) -> Result<(), String> {
+        if self.history.len() < 2 {
+            return Err("There is nothing to compact yet.".into());
+        }
+        self.emit(Event::Compacting);
+        let (provider, model, tuning) = match &ctx.summarizer {
+            Some(other) => (other.provider.as_ref(), &other.model, &other.tuning),
+            None => (ctx.provider.as_ref(), &ctx.model, &ctx.tuning),
         };
-        let mut changed = false;
-        if let Some(cut) = crate::context::cut(&self.history) {
-            let summary = match &ctx.summarizer {
-                Some(other) => {
-                    crate::context::summarize(other.provider.as_ref(), &other.model, None, ctx.context_window, &self.history[..cut], cancel)
-                }
-                None => {
-                    crate::context::summarize(provider.as_ref(), &ctx.model, ctx.effort, ctx.context_window, &self.history[..cut], cancel)
-                }
-            };
-            if let Ok(summary) = summary {
-                let tail = self.history.split_off(cut);
-                self.history = crate::context::join(&summary, tail);
-                changed = true;
-            }
-        }
-        changed |= crate::context::trim_outputs(&mut self.history, 6);
-        if !changed {
-            return Err("There was nothing to compact.".into());
-        }
-        for message in &mut self.history {
-            message.native = None;
-        }
-        self.used = None;
+        let summary = match context::summarize(provider, model, tuning, ctx.context_window, &self.history, cancel) {
+            Ok(summary) => summary,
+            Err(error) => return Err(format!("The conversation could not be summarised: {error}")),
+        };
+        let limit = ctx.context_window.map_or(16_384, context::limit);
+        let kept = if mid_turn { context::recent(&self.history, limit / 4) } else { self.history.len() };
+        let restored = ctx.root.as_deref().map(|root| context::restore(root, &self.history, kept, limit / 6)).unwrap_or_default();
+        self.history = context::rebuild(&summary, &self.history, mid_turn, kept, &restored);
+        self.measured = None;
         self.emit(Event::Compacted { history: self.history.clone() });
         Ok(())
     }

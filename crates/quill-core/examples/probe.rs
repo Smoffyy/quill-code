@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::mpsc::channel;
 
-use quill_core::{Access, ClaudeCode, Decision, Engine, Event, Input, Limits, Op, Toolsets, TurnContext, find_claude, spawn};
+use quill_core::{Access, Decision, Event, Input, Limits, Op, Toolsets, TurnContext, spawn};
 use quill_providers::OpenAi;
 
 fn main() {
@@ -15,19 +15,11 @@ fn main() {
     let session = spawn(Vec::new(), move |event| {
         let _ = tx.send(event);
     });
-    let engine = if url == "claude" {
-        Engine::ClaudeCode(ClaudeCode { binary: find_claude(None).expect("Claude Code is not installed"), resume: None })
-    } else {
-        Engine::Model(Arc::new(OpenAi::new(&url)))
-    };
     let context = TurnContext {
-        engine,
+        provider: Arc::new(OpenAi::new(&url)),
         model,
         summarizer: None,
-        thinking: Some(false),
-        effort: None,
-        max_output: None,
-        server_compaction: false,
+        tuning: Default::default(),
         context_window: None,
         root: Some(root.clone()),
         access: Access::Full,
@@ -50,9 +42,13 @@ fn main() {
                 println!("\n  approving: {} {}", approval.title, approval.subject);
                 session.send(Op::Decide { id, decision: Decision::Approve });
             }
-            Event::QuestionAsked { id, question, options, .. } => {
-                println!("\n  question: {question} {options:?}");
-                session.send(Op::Answer { id, text: options.first().cloned().unwrap_or_else(|| "Yes".into()) });
+            Event::QuestionAsked { id, questions, .. } => {
+                let mut answers = Vec::new();
+                for question in questions {
+                    println!("\n  question: {} {:?}", question.question, question.options);
+                    answers.push(question.options.first().cloned().unwrap_or_else(|| "Yes".into()));
+                }
+                session.send(Op::Answer { id, answers });
             }
             Event::PlanUpdated { steps, .. } => {
                 for step in steps {
@@ -60,9 +56,6 @@ fn main() {
                 }
             }
             Event::Usage { tokens, .. } => println!("\n  usage: {} in, {} out", tokens.prompt, tokens.completion),
-            Event::Cost { usd, .. } => println!("  cost: ${usd:.4}"),
-            Event::ContextWindow { tokens } => println!("  window: {tokens}"),
-            Event::ClaudeSession { link } => println!("  claude session {} at {}", link.session, link.synced),
             Event::TurnFinished { outcome, .. } => {
                 println!("\nresult: {outcome:?}");
                 break;

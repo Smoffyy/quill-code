@@ -3,7 +3,6 @@ use std::f64::consts::TAU;
 const GOLDEN: f64 = 2.399_963_229_728_653;
 const PERSPECTIVE: f64 = 3.4;
 const STRANDS: usize = 3;
-const EASE_RATE: f64 = 4.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum State {
@@ -31,20 +30,6 @@ impl State {
     }
 }
 
-impl Params {
-    pub fn ease(self, target: Params, dt: f64) -> Params {
-        let k = 1.0 - (-dt * EASE_RATE).exp();
-        let mix = |a: f64, b: f64| a + (b - a) * k;
-        Params {
-            braid: mix(self.braid, target.braid),
-            ribbon: mix(self.ribbon, target.ribbon),
-            glass: mix(self.glass, target.glass),
-            spin: mix(self.spin, target.spin),
-            stream: mix(self.stream, target.stream),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Clock {
     pub time: f64,
@@ -55,13 +40,6 @@ pub struct Clock {
 pub const BRAND_FRAME: Clock = Clock { time: 123.1833, angle: 0.5074, flow: 0.0 };
 
 impl Clock {
-    pub fn seeded(seed: u64) -> Clock {
-        let a = hash(seed as f64 * 0.731 + 0.5);
-        let b = hash(seed as f64 * 1.913 + 0.25);
-        let c = hash(seed as f64 * 2.417 + 0.75);
-        Clock { time: a * 10.0, angle: b * TAU, flow: c }
-    }
-
     pub fn advance(&mut self, params: &Params, dt: f64) {
         self.angle += params.spin * dt;
         self.flow += params.stream * dt;
@@ -74,9 +52,7 @@ pub struct Dot {
     pub x: f64,
     pub y: f64,
     pub depth: f64,
-    pub size: f64,
     pub alpha: f64,
-    pub hot: f64,
 }
 
 pub fn point_count(px: f64) -> usize {
@@ -187,18 +163,9 @@ pub fn project(n: usize, params: &Params, clock: &Clock, out: &mut Vec<Dot>) {
             x: acc.x * persp,
             y: -acc.y * persp,
             depth: acc.depth,
-            size: (0.5 + 0.7 * acc.depth) * (1.0 + 0.8 * glow),
             alpha: (0.16 + 0.84 * acc.depth.powf(1.4) + glow * 0.3).min(1.0) * acc.fade,
-            hot: glow,
         });
     }
-}
-
-pub fn depth_order(dots: &[Dot], order: &mut Vec<usize>) {
-    if order.len() != dots.len() {
-        *order = (0..dots.len()).collect();
-    }
-    order.sort_by(|a, b| dots[*a].depth.total_cmp(&dots[*b].depth));
 }
 
 #[cfg(test)]
@@ -210,18 +177,6 @@ mod tests {
         assert_eq!(point_count(4.0), 60);
         assert_eq!(point_count(40.0), 180);
         assert_eq!(point_count(1000.0), 330);
-    }
-
-    #[test]
-    fn easing_converges_on_target() {
-        let mut p = State::Idle.params();
-        for _ in 0..600 {
-            p = p.ease(State::Generating.params(), 1.0 / 60.0);
-        }
-        let g = State::Generating.params();
-        assert!((p.ribbon - g.ribbon).abs() < 1e-3);
-        assert!((p.braid - g.braid).abs() < 1e-3);
-        assert!((p.stream - g.stream).abs() < 1e-3);
     }
 
     #[test]
@@ -269,14 +224,5 @@ mod tests {
             assert!((d.depth - depth).abs() < 1e-9, "depth {i}");
             assert!((d.alpha - alpha).abs() < 1e-9, "alpha {i}");
         }
-    }
-
-    #[test]
-    fn depth_order_sorts_far_to_near() {
-        let mut dots = Vec::new();
-        project(60, &State::Idle.params(), &BRAND_FRAME, &mut dots);
-        let mut order = Vec::new();
-        depth_order(&dots, &mut order);
-        assert!(order.windows(2).all(|w| dots[w[0]].depth <= dots[w[1]].depth));
     }
 }

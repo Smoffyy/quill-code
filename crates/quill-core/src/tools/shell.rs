@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
@@ -11,7 +11,9 @@ use super::args::{self, COMMAND};
 use super::paths::resolve;
 use super::{Ctx, Output, Prepared, Spec, Tool, Toolset};
 use crate::options::Shell;
-use crate::policy::Effect;
+use crate::policy::{Effect, edits_files};
+
+const SCRIPT_EDIT: &str = "Change files with edit_file or write_file, not with shell commands or scripts, so the user sees a diff of every change. Use shell to run programs, builds and tests.";
 use crate::protocol::Category;
 
 pub fn shell_command(shell: Shell, command: &str) -> Command {
@@ -64,6 +66,31 @@ pub(crate) fn hide_window(cmd: &mut Command) {
 #[cfg(not(windows))]
 pub(crate) fn hide_window(_: &mut Command) {}
 
+#[cfg(windows)]
+fn own_group(_: &mut Command) {}
+
+#[cfg(not(windows))]
+fn own_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+}
+
+#[cfg(windows)]
+fn stop(child: &mut Child) {
+    let mut taskkill = Command::new("taskkill");
+    taskkill.args(["/T", "/F", "/PID"]).arg(child.id().to_string()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    hide_window(&mut taskkill);
+    let _ = taskkill.status();
+    let _ = child.kill();
+}
+
+#[cfg(not(windows))]
+fn stop(child: &mut Child) {
+    let group = format!("-{}", child.id());
+    let _ = Command::new("kill").args(["-KILL", "--", &group]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let _ = child.kill();
+}
+
 fn cap(text: String, max: usize) -> String {
     if text.len() <= max {
         return text;
@@ -102,7 +129,9 @@ pub fn run(
     max_output: usize,
     on_chunk: &dyn Fn(&str),
 ) -> (bool, String) {
-    let spawned = shell_command(shell, command).current_dir(dir).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+    let mut cmd = shell_command(shell, command);
+    own_group(&mut cmd);
+    let spawned = cmd.current_dir(dir).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
     let mut child = match spawned {
         Ok(child) => child,
         Err(e) => return (false, format!("The command could not start: {e}")),
@@ -129,11 +158,11 @@ pub fn run(
             match child.try_wait() {
                 Ok(Some(status)) => outcome = Some((Some(status), None)),
                 Ok(None) if cancel.load(Ordering::Relaxed) => {
-                    let _ = child.kill();
+                    stop(&mut child);
                     outcome = Some((None, Some("Stopped by the user.".to_string())));
                 }
                 Ok(None) if started.elapsed() > timeout => {
-                    let _ = child.kill();
+                    stop(&mut child);
                     outcome = Some((None, Some(format!("Stopped after {} seconds without finishing.", timeout.as_secs()))));
                 }
                 Ok(None) => {}
@@ -212,6 +241,9 @@ impl Tool for ShellTool {
 
     fn prepare(&self, args: &Value, ctx: &Ctx<'_>) -> Result<Prepared, String> {
         let command = args::trimmed(args, &COMMAND).ok_or("shell needs a \"command\".")?.to_string();
+        if edits_files(&command) {
+            return Err(SCRIPT_EDIT.into());
+        }
         let dir = match args::trimmed(args, &["workdir", "cwd", "dir", "directory"]) {
             Some(rel) => resolve(ctx.root, rel)?,
             None => ctx.root.to_path_buf(),
@@ -244,6 +276,29 @@ pub(crate) fn similar(command: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopping_ends_the_programs_a_command_started() {
+        let dir = std::env::temp_dir().join(format!("quill-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let command = if cfg!(windows) {
+            "cmd /C \"ping -n 3 127.0.0.1 >nul & echo late > marker.txt\""
+        } else {
+            "sh -c 'sleep 2; echo late > marker.txt'"
+        };
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let stopper = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            stopper.store(true, Ordering::Relaxed);
+        });
+        let (ok, output) = run(Shell::default(), &dir, command, Duration::from_secs(60), &cancel, 30_000, &|_| {});
+        assert!(!ok && output.starts_with("Stopped by the user."), "{output}");
+        std::thread::sleep(Duration::from_secs(4));
+        assert!(!dir.join("marker.txt").exists(), "the started program kept running");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn commands_report_exit_codes_and_stream() {

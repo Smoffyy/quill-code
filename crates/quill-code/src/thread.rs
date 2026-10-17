@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use quill_core::tools::legacy;
-use quill_core::{Category, ClaudeLink, FileDiff, PlanStep, ToolView};
+use quill_core::{Category, FileDiff, PlanStep, ToolView};
 use quill_providers::{Message, Tokens};
 use serde::{Deserialize, Serialize};
 
@@ -167,11 +167,7 @@ pub struct Turn {
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
-    pub cost: Option<f64>,
-    #[serde(default)]
     pub usage: Tokens,
-    #[serde(skip)]
-    pub expanded: bool,
 }
 
 pub struct FileChanges {
@@ -192,9 +188,7 @@ impl Turn {
             attachments,
             images: Vec::new(),
             model: None,
-            cost: None,
             usage: Tokens::default(),
-            expanded: false,
         }
     }
 
@@ -241,13 +235,13 @@ impl Turn {
         })
     }
 
-    pub fn answer(&mut self, id: &str, text: &str) {
-        for item in &mut self.items {
-            if let Item::Question { id: question, answer, .. } = item
-                && question == id
-            {
-                *answer = Some(text.to_string());
-            }
+    pub fn answer(&mut self, id: &str, answers: &[String]) {
+        let asked = self.items.iter_mut().filter_map(|item| match item {
+            Item::Question { id: question, answer, .. } if question == id => Some(answer),
+            _ => None,
+        });
+        for (answer, text) in asked.zip(answers) {
+            *answer = Some(text.clone());
         }
     }
 
@@ -279,23 +273,6 @@ impl Turn {
         }
     }
 
-    pub fn final_text(&self) -> Option<usize> {
-        if self.working() {
-            return None;
-        }
-        let last = self.items.iter().rposition(|item| matches!(item, Item::Text(t) if !t.trim().is_empty()))?;
-        let tools_after = self.items[last..].iter().any(|item| matches!(item, Item::Tool(_)));
-        (!tools_after).then_some(last)
-    }
-
-    pub fn has_steps(&self) -> bool {
-        let final_text = self.final_text();
-        self.items
-            .iter()
-            .enumerate()
-            .any(|(index, item)| Some(index) != final_text && !matches!(item, Item::Text(t) if t.trim().is_empty()))
-    }
-
     pub fn changes(&self) -> Vec<FileChanges> {
         let mut by_path: BTreeMap<String, FileChanges> = BTreeMap::new();
         for diff in self.diffs() {
@@ -320,55 +297,6 @@ impl Turn {
             })
             .flatten()
     }
-
-    pub fn summary(&self) -> String {
-        let files = self.changes().len();
-        let (mut commands, mut reads, mut searches, mut other, mut asked) = (0, 0, 0, 0, 0);
-        for item in &self.items {
-            if let Item::Tool(tool) = item {
-                match (tool.category, tool.tool.as_str()) {
-                    (Category::Command, _) => commands += 1,
-                    (Category::Explore, "read_file") => reads += 1,
-                    (Category::Explore, _) => searches += 1,
-                    (Category::Question, _) => asked += 1,
-                    (Category::Edit | Category::Plan, _) => {}
-                    _ => other += 1,
-                }
-            }
-        }
-        let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-        let mut parts = Vec::new();
-        if files > 0 {
-            parts.push(format!("changed {}", count(files, "file", "files")));
-        }
-        if commands > 0 {
-            parts.push(format!("ran {}", count(commands, "command", "commands")));
-        }
-        if reads > 0 {
-            parts.push(format!("read {}", count(reads, "file", "files")));
-        }
-        if searches > 0 {
-            parts.push(format!("searched {}", count(searches, "time", "times")));
-        }
-        if asked > 0 {
-            parts.push(format!("asked you {}", count(asked, "question", "questions")));
-        }
-        if other > 0 {
-            let noun = if other == 1 { "action" } else { "actions" };
-            parts.push(format!("performed {other} {}{noun}", if parts.is_empty() { "" } else { "other " }));
-        }
-        let sentence = match parts.len() {
-            0 => return "Thought it through".into(),
-            1 => parts.remove(0),
-            2 => parts.join(" and "),
-            _ => {
-                let last = parts.pop().unwrap_or_default();
-                format!("{}, and {last}", parts.join(", "))
-            }
-        };
-        let mut chars = sentence.chars();
-        chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -387,11 +315,7 @@ pub struct Thread {
     #[serde(default)]
     pub context_used: Option<u64>,
     #[serde(default)]
-    pub context_window: Option<u64>,
-    #[serde(default)]
     pub provider: Option<String>,
-    #[serde(default)]
-    pub claude: Option<ClaudeLink>,
 }
 
 impl Thread {
@@ -408,9 +332,7 @@ impl Thread {
             worktree: None,
             model: None,
             context_used: None,
-            context_window: None,
             provider: None,
-            claude: None,
         }
     }
 
@@ -475,9 +397,9 @@ mod tests {
         turn.items.push(tool("1", "read_file", Vec::new()));
         turn.push_text("Done");
         assert_eq!(turn.items.len(), 3);
-        assert!(turn.final_text().is_none());
+        assert!(matches!(&turn.items[0], Item::Text(t) if t == "Hello"));
         turn.finish(TurnState::Done);
-        assert_eq!(turn.final_text(), Some(2));
+        assert!(!turn.working() && turn.worked_ms.is_some());
     }
 
     #[test]
@@ -488,22 +410,8 @@ mod tests {
         turn.push_reasoning("All updated.");
         turn.push_text("\n");
         turn.finish(TurnState::Done);
-        assert_eq!(turn.final_text(), Some(2));
         assert!(matches!(&turn.items[0], Item::Reasoning(_)));
         assert!(matches!(&turn.items[2], Item::Text(t) if t == "All updated."));
-    }
-
-    #[test]
-    fn summary_reads_like_a_sentence() {
-        let mut turn = Turn::new("p".into(), Vec::new());
-        turn.items.push(tool("1", "write_file", vec![diff_text("a.py", None, "x\n")]));
-        turn.items.push(tool("2", "shell", Vec::new()));
-        turn.items.push(tool("3", "read_file", Vec::new()));
-        turn.items.push(tool("4", "list_dir", Vec::new()));
-        assert_eq!(turn.summary(), "Changed 1 file, ran 1 command, read 1 file, and searched 1 time");
-        let mut reads = Turn::new("p".into(), Vec::new());
-        reads.items.push(tool("1", "read_file", Vec::new()));
-        assert_eq!(reads.summary(), "Read 1 file");
     }
 
     #[test]

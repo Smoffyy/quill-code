@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 
 use super::args;
 use super::{Ctx, Output, Prepared, Spec, Tool, Toolset};
-use crate::protocol::{Category, PlanStep, StepStatus};
+use crate::protocol::{Category, PlanStep, Question, StepStatus};
 
 pub struct UpdatePlan;
 
@@ -28,7 +28,7 @@ fn status(value: &str) -> StepStatus {
     }
 }
 
-fn steps(args: &Value) -> Vec<PlanStep> {
+pub(crate) fn steps(args: &Value) -> Vec<PlanStep> {
     let list = ["plan", "steps", "items", "todos"].iter().find_map(|key| args.get(*key).and_then(Value::as_array));
     list.map(|items| {
         items
@@ -103,9 +103,53 @@ const ASK: Spec = Spec {
     active: "Asking",
     done: "Asked",
     parallel: false,
-    description: "Ask the user a question and wait for the answer. Use it only when you cannot continue without a decision from them. Offer short options when there are clear choices.",
-    guide: "ask_user asks the user a question and waits. Use it only when you are blocked on a decision that is theirs to make.",
+    description: "Ask the user one to four questions and wait for the answers. Use it only when you cannot continue without decisions from them. Put each choice in options, never as a list inside the question text: the user picks one with the arrow keys or types their own answer.",
+    guide: "ask_user asks the user up to four questions at once and waits. Use it only when you are blocked on decisions that are theirs to make, and give each question short options.",
 };
+
+fn question(value: &Value) -> Option<Question> {
+    let question = args::trimmed(value, &["question", "text", "prompt"])?.to_string();
+    let options = ["options", "choices"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_array))
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().or_else(|| item["label"].as_str()))
+                .map(|option| option.trim().to_string())
+                .filter(|option| !option.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(Question { question, options })
+}
+
+fn questions(args: &Value) -> Vec<Question> {
+    match args.get("questions").and_then(Value::as_array) {
+        Some(items) => items.iter().filter_map(question).collect(),
+        None => question(args).into_iter().collect(),
+    }
+}
+
+fn reply(question: &Question, answer: &str) -> String {
+    if question.options.is_empty() || question.options.iter().any(|option| option == answer) {
+        answer.to_string()
+    } else {
+        format!("{answer} (in their own words, not one of the options)")
+    }
+}
+
+fn answered(questions: &[Question], answers: &[String]) -> String {
+    if let ([question], [answer]) = (questions, answers) {
+        return format!("The user answered: {}", reply(question, answer));
+    }
+    let pairs: Vec<String> = questions
+        .iter()
+        .zip(answers)
+        .map(|(question, answer)| format!("{}\nAnswer: {}", question.question, reply(question, answer)))
+        .collect();
+    format!("The user answered:\n\n{}", pairs.join("\n\n"))
+}
 
 impl Tool for AskUser {
     fn spec(&self) -> &'static Spec {
@@ -116,26 +160,34 @@ impl Tool for AskUser {
         json!({
             "type": "object",
             "properties": {
-                "question": { "type": "string", "description": "The question to ask." },
-                "options": { "type": "array", "items": { "type": "string" }, "description": "Optional short answers to choose from." }
+                "questions": {
+                    "type": "array",
+                    "description": "One to four questions, asked together.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": { "type": "string", "description": "The question to ask." },
+                            "options": { "type": "array", "items": { "type": "string" }, "description": "Two to four short answers to choose from. The user can always type their own." }
+                        },
+                        "required": ["question"]
+                    }
+                }
             },
-            "required": ["question"]
+            "required": ["questions"]
         })
     }
 
     fn target(&self, args: &Value) -> String {
-        args::trimmed(args, &["question", "text", "prompt"]).unwrap_or_default().to_string()
+        questions(args).first().map(|question| question.question.clone()).unwrap_or_default()
     }
 
     fn prepare(&self, args: &Value, _: &Ctx<'_>) -> Result<Prepared, String> {
-        let question = args::trimmed(args, &["question", "text", "prompt"]).ok_or("ask_user needs a \"question\".")?.to_string();
-        let options: Vec<String> = ["options", "choices"]
-            .iter()
-            .find_map(|key| args.get(*key).and_then(Value::as_array))
-            .map(|items| items.iter().filter_map(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
-            .unwrap_or_default();
-        Ok(Prepared::read(Box::new(move |ctx: &Ctx<'_>| match ctx.host.ask(&question, &options) {
-            Some(answer) => Output::ok(format!("The user answered: {answer}")),
+        let questions = questions(args);
+        if questions.is_empty() {
+            return Err("ask_user needs \"questions\": a list of objects with a \"question\" and its \"options\".".into());
+        }
+        Ok(Prepared::read(Box::new(move |ctx: &Ctx<'_>| match ctx.host.ask(&questions) {
+            Some(answers) => Output::ok(answered(&questions, &answers)),
             None => Output::fail("The user did not answer."),
         })))
     }
@@ -154,5 +206,17 @@ mod tests {
         let loose = json!({ "todos": ["one", { "content": "two", "state": "done" }] });
         assert_eq!(steps(&loose).len(), 2);
         assert_eq!(steps(&loose)[1].status, StepStatus::Done);
+    }
+
+    #[test]
+    fn questions_come_one_or_several_at_a_time() {
+        let one = json!({ "question": "Which?", "options": ["a", "b"] });
+        assert_eq!(questions(&one), vec![Question { question: "Which?".into(), options: vec!["a".into(), "b".into()] }]);
+        let several = json!({ "questions": [{ "question": "Name?" }, { "question": "Tests?", "options": [{ "label": "Yes" }] }] });
+        let parsed = questions(&several);
+        assert_eq!((parsed.len(), parsed[1].options.clone()), (2, vec!["Yes".to_string()]));
+        assert_eq!(answered(&parsed[..1], &["x".into()]), "The user answered: x");
+        assert!(answered(&parsed, &["x".into(), "Yes".into()]).contains("Tests?\nAnswer: Yes"));
+        assert!(answered(&parsed[1..], &["Maybe".into()]).ends_with("Maybe (in their own words, not one of the options)"));
     }
 }

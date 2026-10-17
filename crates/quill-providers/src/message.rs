@@ -38,7 +38,6 @@ pub struct Message {
     pub images: Vec<String>,
     pub tool_calls: Vec<ToolCall>,
     pub tool_call_id: Option<String>,
-    pub native: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -50,8 +49,6 @@ struct RawMessage {
     tool_calls: Vec<ToolCall>,
     #[serde(default)]
     tool_call_id: Option<String>,
-    #[serde(default)]
-    native: Option<Value>,
 }
 
 impl From<RawMessage> for Message {
@@ -65,23 +62,19 @@ impl From<RawMessage> for Message {
             }
             _ => (String::new(), Vec::new()),
         };
-        Message { role: raw.role, content, images, tool_calls: raw.tool_calls, tool_call_id: raw.tool_call_id, native: raw.native }
+        Message { role: raw.role, content, images, tool_calls: raw.tool_calls, tool_call_id: raw.tool_call_id }
     }
 }
 
 impl Serialize for Message {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut value = self.wire();
-        if let Some(native) = &self.native {
-            value["native"] = native.clone();
-        }
-        value.serialize(serializer)
+        self.wire().serialize(serializer)
     }
 }
 
 impl Message {
     fn new(role: Role, content: impl Into<String>) -> Message {
-        Message { role, content: content.into(), images: Vec::new(), tool_calls: Vec::new(), tool_call_id: None, native: None }
+        Message { role, content: content.into(), images: Vec::new(), tool_calls: Vec::new(), tool_call_id: None }
     }
 
     pub fn system(content: impl Into<String>) -> Message {
@@ -148,17 +141,5 @@ mod tests {
         assert_eq!(result["role"], "tool");
         assert_eq!(result["tool_call_id"], "c1");
         assert!(serde_json::to_value(Message::user("x")).unwrap().get("tool_calls").is_none());
-    }
-
-    #[test]
-    fn native_content_is_stored_but_never_sent() {
-        let message = Message {
-            native: Some(json!([{ "type": "thinking", "thinking": "", "signature": "s" }])),
-            ..Message::assistant("hi", Vec::new())
-        };
-        let stored = serde_json::to_value(&message).unwrap();
-        assert_eq!(stored["native"][0]["signature"], "s");
-        assert_eq!(serde_json::from_value::<Message>(stored).unwrap(), message);
-        assert!(message.wire().get("native").is_none());
     }
 }

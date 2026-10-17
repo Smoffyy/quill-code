@@ -75,6 +75,7 @@ Edits keep each file's final newline, or its lack of one, unless you ask Quill t
 | Ctrl+D | Quit when the prompt is empty |
 | ↑ ↓ | Earlier prompts |
 | Tab | Take the highlighted suggestion |
+| Alt+V | Attach an image from the clipboard |
 | `@path` | Bring a file into the prompt; images go to models that can see them |
 
 Paste or drag a file path into the prompt to attach the file.

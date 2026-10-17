@@ -13,7 +13,9 @@ use quill_providers::{Control, context_label, normalize_url};
 use quill_weave::State;
 
 use crate::Msg;
+use crate::attachments::Attachment;
 use crate::backend::{self, Backend, Connection};
+use crate::clipboard;
 use crate::commit::{Flow, Update};
 use crate::composer::Composer;
 use crate::config::{Config, personal_instructions_path};
@@ -149,6 +151,7 @@ fn help() -> Vec<Line> {
         ("ctrl+c", "clear the prompt or stop; press twice to quit"),
         ("↑ ↓", "move through earlier prompts"),
         ("tab", "take the highlighted suggestion"),
+        ("alt+v", "attach an image from the clipboard"),
         ("@path", "bring in a file; images go to models that can see them"),
     ];
     for (key, action) in keys {
@@ -686,6 +689,7 @@ impl App {
                 }
             }
             KeyCode::Enter if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => self.submit(),
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::ALT) => self.paste_image(),
             _ => {
                 if self.composer.key(key) {
                     self.refresh_suggestions();
@@ -716,6 +720,17 @@ impl App {
                 self.composer.paste(text);
                 self.refresh_suggestions();
             }
+        }
+    }
+
+    fn paste_image(&mut self) {
+        match clipboard::save_image() {
+            Ok(Some(path)) => {
+                let name = format!("clipboard {}.png", self.composer.attachments.len() + 1);
+                self.composer.attachments.push(Attachment { path, name, image: true });
+            }
+            Ok(None) => self.notice("No image on the clipboard."),
+            Err(error) => self.problem(format!("Could not read the clipboard: {error}")),
         }
     }
 
@@ -885,6 +900,9 @@ impl App {
                 }
                 None => {}
             }
+        }
+        if self.workspace.running() && !self.composer.attachments.is_empty() {
+            return self.problem("Wait for the reply to finish, or stop it with esc, before sending attachments.");
         }
         let prompt = self.composer.take();
         self.suggestions = None;

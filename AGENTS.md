@@ -21,7 +21,7 @@ Releases (`.github/workflows/release.yml`) run when `main` gets a workspace vers
 ## Rules that do not bend
 
 - **No telemetry.** No analytics, crash reporting or update pings. quill talks only to the model providers the user configured (local servers, OpenAI-compatible services, Anthropic), to the Claude Code program the user installed, to git remotes through the user's own `git`, and to the GitHub API for what the user asked for: creating a repository, opening a pull request, and reading pull request status for branches whose origin is on GitHub. `deny.toml` bans the usual telemetry crates; do not add network calls anywhere else.
-- **Permissive licences only.** The project is MIT. Dependencies must pass `cargo deny check` for every release target; the only exception is the `webpki-root-certs` data crate (CDLA-Permissive-2.0) that ureq's `native-tls` feature pulls in. Unmaintained-crate advisories are checked for direct dependencies only (`unmaintained = "workspace"`). Nothing GPL is bundled: Git features use the user's installed `git` and say so when it is missing.
+- **Permissive licences only.** The project is MIT. Dependencies must pass `cargo deny check` for every release target; the exceptions are the `webpki-root-certs` data crate (CDLA-Permissive-2.0) that ureq's `native-tls` feature pulls in, and `clipboard-win` and `error-code` (BSL-1.0) that arboard's Windows clipboard pulls in. Unmaintained-crate advisories are checked for direct dependencies only (`unmaintained = "workspace"`). Nothing GPL is bundled: Git features use the user's installed `git` and say so when it is missing.
 - **GitHub sign-in is Git's.** quill never stores a token. `github.rs` asks `git credential fill` for one, so Git Credential Manager signs the user in the first time they publish. Background checks pass `GCM_INTERACTIVE=never` so they can never pop a sign-in window, and `GIT_TERMINAL_PROMPT=0` keeps Git from prompting inside the screen.
 - **Models are detected, not configured.** `/v1/models` gives the list, status, vision and the window size (llama.cpp `meta.n_ctx` or `--ctx-size`, vLLM `max_model_len`, LM Studio `loaded_context_length`, then `context_length`). `/props?model=<id>` gives llama.cpp's template capabilities; reading it for an unloaded model loads it, so it is only read for the selected model once it is loaded or used. Anthropic's `/v1/models` gives window, output limit, vision, effort levels and server-side compaction. Claude Code models are the aliases listed for it (`fable`, `opus`, `sonnet`, `haiku`); the exact version each one resolves to is read from Claude Code's init event and cached in `claude-models.json` in the settings folder, so the picker says "Claude Haiku 5.5". Settings only fill in what a provider does not report.
 - **Keys live in the system keychain.** API keys are stored with the `keyring` crate (Windows Credential Manager, the macOS Keychain, the Secret Service on Linux) under the service `quill-code` and the provider's id, never in `settings.json` or a thread; `quill key set <provider>` saves one. `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` are used only for providers pointing at the official addresses. Claude Code always runs on the user's own sign-in: Quill never reads its credentials and removes `ANTHROPIC_API_KEY` from its environment so a stray key does not bill the API instead of the user's plan.
@@ -81,6 +81,7 @@ crates/
     usage.rs      usage log (usage.jsonl, one line per finished turn, seeded from existing threads) and the /usage report
     mentions.rs   slash commands, @ file index and ranking
     attachments.rs  images as data URLs, text files as fenced blocks
+    clipboard.rs  the clipboard's image as a PNG file, for Alt+V
     store.rs      threads in the settings folder's threads/, sent images in images/<thread>
     config.rs     the settings: load, save on every change, reload when the file changes, refuse to save over a broken file
     project.rs, weave.rs (the weave drawn in braille)
@@ -125,7 +126,7 @@ The last line of the live area shows the model, its reasoning setting, the acces
 - Prompts start with `›`, settled tool rows with a green `•` or a red `✗`, running ones with a braille spinner; list selections are marked `▸` and the current choice `✓`. Diffs show one line number with additions in green and removals in red. Notices start with `·`, problems with `!`.
 - A dim rule separates the scrollback from the prompt; the status line sits at the bottom.
 - The weave is drawn live from `quill-weave` as braille on the welcome banner and stays monochrome; `quill-weave` is pinned by tests to exact reference frames.
-- Keys: Enter sends (and steers while Quill works), Shift+Enter, Alt+Enter or Ctrl+J add a line, Esc stops or closes, Ctrl+C clears, stops, or quits when pressed twice, Ctrl+D quits on an empty prompt, Tab takes a suggestion.
+- Keys: Enter sends (and steers while Quill works), Shift+Enter, Alt+Enter or Ctrl+J add a line, Esc stops or closes, Ctrl+C clears, stops, or quits when pressed twice, Ctrl+D quits on an empty prompt, Tab takes a suggestion, Alt+V attaches an image from the clipboard.
 
 ## Conventions
 

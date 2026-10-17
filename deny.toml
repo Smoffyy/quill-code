@@ -16,6 +16,8 @@ allow = [
 confidence-threshold = 0.9
 exceptions = [
     { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+    { allow = ["BSL-1.0"], crate = "clipboard-win" },
+    { allow = ["BSL-1.0"], crate = "error-code" },
 ]
 
 [bans]

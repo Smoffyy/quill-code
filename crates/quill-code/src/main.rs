@@ -1,6 +1,7 @@
 mod app;
 mod attachments;
 mod backend;
+mod clipboard;
 mod commands;
 mod commit;
 mod composer;

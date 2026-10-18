@@ -1793,6 +1793,7 @@ pub fn run(root: PathBuf, resume: bool, isolate: bool, prompt: String) -> u8 {
             drawn = None;
         }
         app.refresh_thought();
+        app.advance();
         let out = app.take_out();
         let frame = app.live();
         if !out.is_empty() || drawn.as_ref() != Some(&frame) {

@@ -12,6 +12,8 @@ const OUTPUT_LINES: usize = 3;
 const FAILED_LINES: usize = 8;
 const LIVE_OUTPUT: usize = 5;
 const LIVE_TEXT: usize = 14;
+const LIVE_TOOLS: usize = 4;
+const HOLD_MS: u64 = 3000;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Look {
@@ -391,14 +393,22 @@ fn group_tools(items: &[Item]) -> Vec<&ToolItem> {
         .collect()
 }
 
-pub fn group_rows(tools: &[&ToolItem], look: Look, spinner: &str) -> Vec<Line> {
+fn held(tools: &[&ToolItem]) -> bool {
+    tools.iter().filter_map(|tool| tool.ended).max().is_some_and(|ended| now_ms() < ended + HOLD_MS)
+}
+
+fn group_head(tools: &[&ToolItem], look: Look, spinner: &str) -> Line {
     let working = tools.iter().any(|tool| tool.working());
     let mut head = if working { Line::styled(format!("{spinner} "), accent()) } else { Line::plain("  ") };
     head.append(explored(tools, working));
-    let mut lines = vec![truncate(&head, look.width)];
-    for tool in tools.iter().filter(|tool| tool.working() && tool.category == Category::Command) {
+    truncate(&head, look.width)
+}
+
+pub fn group_rows(tools: &[&ToolItem], look: Look, spinner: &str) -> Vec<Line> {
+    let mut lines = vec![group_head(tools, look, spinner)];
+    for tool in &tools[tools.len().saturating_sub(LIVE_TOOLS)..] {
         lines.extend(tool_rows(tool, look, spinner));
-        if tool.status == ToolStatus::Running {
+        if tool.status == ToolStatus::Running && tool.category == Category::Command {
             lines.extend(running_command(tool, look));
         }
     }
@@ -688,10 +698,10 @@ impl Progress {
                     let (end, scanned) = group_span(&turn.items, self.item, look);
                     let tools = group_tools(&turn.items[self.item..end]);
                     let closed = scanned < turn.items.len() || !working;
-                    if !closed || tools.iter().any(|tool| tool.working()) {
+                    if !closed || tools.iter().any(|tool| tool.working()) || held(&tools) {
                         break;
                     }
-                    block(&mut out, group_rows(&tools, look, "•"));
+                    block(&mut out, vec![group_head(&tools, look, "•")]);
                     self.item = end;
                     self.offset = 0;
                     continue;
@@ -826,7 +836,10 @@ mod tests {
         turn.items.push(tool("1", "read_file", "src/a.rs (lines 260-294)", ToolStatus::Done));
         turn.items.push(tool("2", "grep", "TODO", ToolStatus::Running));
         assert!(progress.advance(&turn, look()).is_empty());
-        assert_eq!(texts(&progress.live(&turn, look(), "*", None)), vec!["", "* Reading 1 file, searching for 1 pattern"]);
+        assert_eq!(
+            texts(&progress.live(&turn, look(), "*", None)),
+            vec!["", "* Reading 1 file, searching for 1 pattern", "● Read(src/a.rs (lines 260-294))", "* Search(TODO)"]
+        );
         if let Item::Tool(grep) = &mut turn.items[1] {
             grep.status = ToolStatus::Done;
         }
@@ -835,7 +848,14 @@ mod tests {
         let wide = Look { width: 100, ..look() };
         assert_eq!(
             texts(&progress.live(&turn, wide, "*", None)),
-            vec!["", "* Reading 1 file, searching for 1 pattern, running 1 shell command", "* Shell(cargo test)", "  └ Running…"]
+            vec![
+                "",
+                "* Reading 1 file, searching for 1 pattern, running 1 shell command",
+                "● Read(src/a.rs (lines 260-294))",
+                "● Search(TODO)",
+                "* Shell(cargo test)",
+                "  └ Running…"
+            ]
         );
         if let Item::Tool(shell) = &mut turn.items[2] {
             shell.status = ToolStatus::Done;
@@ -844,6 +864,25 @@ mod tests {
         turn.finish(TurnState::Done);
         let rest = texts(&progress.advance(&turn, look()));
         assert_eq!(rest[..2], ["".to_string(), "  Read 1 file, searched for 1 pattern, ran 1 shell command".to_string()]);
+    }
+
+    #[test]
+    fn finished_searches_stay_open_for_a_moment() {
+        let mut turn = Turn::new("p".into(), Vec::new());
+        let mut progress = Progress::new();
+        let mut item = ToolItem::new(legacy("grep"));
+        item.id = "1".into();
+        item.target = "send".into();
+        item.status = ToolStatus::Done;
+        item.ended = Some(now_ms());
+        turn.items.push(Item::Tool(item));
+        turn.push_text("Next.");
+        assert!(progress.advance(&turn, look()).is_empty());
+        assert_eq!(texts(&progress.live(&turn, look(), "*", None))[..3], ["", "  Searched for 1 pattern", "● Search(send)"]);
+        if let Item::Tool(grep) = &mut turn.items[0] {
+            grep.ended = Some(now_ms() - HOLD_MS - 1);
+        }
+        assert_eq!(texts(&progress.advance(&turn, look()))[..2], ["".to_string(), "  Searched for 1 pattern".to_string()]);
     }
 
     #[test]

@@ -26,8 +26,8 @@ const WORKFLOW: &str = "# How to work
 
 1. Understand the request. If it is unclear in a way that changes the result, ask with ask_user. Otherwise make a sensible choice and mention it.
 2. For work with more than two steps, write a short plan with update_plan, keep one step in_progress, and update it as you go.
-3. Explore before changing anything: find the relevant files and read them.
-4. Make focused changes that follow the project's existing style, naming and structure. Do not reformat or rewrite code the task does not touch.
+3. Explore before changing anything, and search before you read. Grep for the exact names the request mentions, such as functions, types, constants, messages or settings, and use find_files for file names. Then read_file only the lines around those matches, with start_line and end_line; read a whole file only when it is short or you need all of it. Send searches and reads that do not depend on each other together in one reply, so they run at the same time, instead of one per reply.
+4. Before a change, say in one short sentence which file and names you are about to change and why. Then make focused changes that follow the project's existing style, naming and structure. Do not reformat or rewrite code the task does not touch.
 5. Check your work as described under Checking your work, and fix whatever broke.
 6. When a tool call fails, read the error and change your approach. Never repeat a call that failed in exactly the same way.
 7. When the user declines a change or a command, do not try it again in another form. Ask what they would like instead.

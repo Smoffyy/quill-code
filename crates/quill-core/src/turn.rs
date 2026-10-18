@@ -2,11 +2,12 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use quill_providers::{ChatRequest, Error, Event as Stream, Message, Provider, StopReason, ToolCall, ToolSpec};
+use serde_json::Value;
 
 use crate::context;
 use crate::policy::{self, Access, Effect, Rule, Verdict};
 use crate::prompt::{PromptContext, system_prompt};
-use crate::protocol::{Approval, Decision, Event, Outcome, PlanStep, Question};
+use crate::protocol::{Approval, Category, Decision, Event, Outcome, PlanStep, Question};
 use crate::session::{Inbox, Input, Session, Sink, TurnContext};
 use crate::tools::{self, Ctx, Host, Output, Prepared, Tool, Toolset};
 
@@ -20,6 +21,10 @@ const MALFORMED_RETRIES: usize = 2;
 const UNASKED_GIT: &str = "The user has not asked for a commit or a pull request, so leave the changes uncommitted and finish with your reply. The user commits when they choose to.";
 
 const CRAMPED: &str = "The context filled up three times in this turn, so Quill stopped compacting it. The task may need a model with a bigger context window, or smaller steps.";
+
+const REPEATED: &str = "This is the same call, with the same arguments, that already failed earlier in this turn. Do not send it again: change the arguments or take a different approach.";
+
+const UNCHANGED: &str = "Unchanged: this is the same result as the identical call earlier in this turn, and nothing has changed since. Use that earlier result and go on to the next step instead of calling again.";
 
 #[derive(Default)]
 struct Reply {
@@ -88,6 +93,7 @@ pub(crate) fn run(
     let mut floor = 0;
     let mut compactions = 0;
     let mut warned = false;
+    let mut recall = Recall::default();
     let growth = ctx.context_window.map_or(0, |window| context::limit(window) / 4);
     for _ in 0..ctx.limits.max_steps {
         if cancel.load(Ordering::Relaxed) {
@@ -96,6 +102,7 @@ pub(crate) fn run(
         session.take_steers();
         let used = session.used(overhead);
         if ctx.limits.auto_compact && context::over(used, ctx.context_window) && used.saturating_sub(floor) > growth {
+            recall.seen.clear();
             if compactions < MAX_COMPACTIONS {
                 compactions += usize::from(make_room(session, ctx, cancel, overhead));
             } else if !warned {
@@ -115,6 +122,7 @@ pub(crate) fn run(
                 if !again || !compact(session, ctx, cancel) {
                     return Outcome::Failed(error.0);
                 }
+                recall.seen.clear();
                 compactions += 1;
                 retried = true;
                 continue;
@@ -150,7 +158,7 @@ pub(crate) fn run(
             }
             return Outcome::Done;
         }
-        run_calls(session, turn, ctx, &tools, &calls, cancel);
+        run_calls(session, turn, ctx, &tools, &calls, cancel, &mut recall);
     }
     Outcome::Failed(format!("Stopped after {} steps. Send a follow-up to let the agent continue.", ctx.limits.max_steps))
 }
@@ -252,7 +260,15 @@ fn step(
     Ok(reply)
 }
 
-fn run_calls(session: &mut Session, turn: usize, ctx: &TurnContext, tools: &[Box<dyn Tool>], calls: &[ToolCall], cancel: &AtomicBool) {
+fn run_calls(
+    session: &mut Session,
+    turn: usize,
+    ctx: &TurnContext,
+    tools: &[Box<dyn Tool>],
+    calls: &[ToolCall],
+    cancel: &AtomicBool,
+    recall: &mut Recall,
+) {
     let mut index = 0;
     while index < calls.len() {
         if cancel.load(Ordering::Relaxed) {
@@ -272,7 +288,9 @@ fn run_calls(session: &mut Session, turn: usize, ctx: &TurnContext, tools: &[Box
         let end = index + batch.max(1);
         let outputs = run_batch(session, turn, ctx, tools, &calls[index..end], cancel);
         for (call, output) in calls[index..end].iter().zip(outputs) {
-            finish(session, turn, call, output);
+            let explore = tools::find(tools, &call.function.name).is_some_and(|tool| tool.spec().category == Category::Explore);
+            let text = recall.reply(call, &output, explore);
+            finish(session, turn, call, output, text);
         }
         index = end;
     }
@@ -401,16 +419,42 @@ pub(crate) fn permit(session: &Session, turn: usize, ctx: &TurnContext, request:
     }
 }
 
-fn finish(session: &mut Session, turn: usize, call: &ToolCall, output: Output) {
+#[derive(Default)]
+struct Recall {
+    failed: Vec<(String, Value)>,
+    seen: Vec<(String, Value, String)>,
+}
+
+impl Recall {
+    fn reply(&mut self, call: &ToolCall, output: &Output, explore: bool) -> String {
+        let (name, args) = (call.function.name.trim().to_ascii_lowercase(), tools::parse_args(&call.function.arguments));
+        if !output.ok {
+            let key = (name, args);
+            if self.failed.contains(&key) {
+                return format!("Error: {}\n\n{REPEATED}", output.text);
+            }
+            self.failed.push(key);
+            return format!("Error: {}", output.text);
+        }
+        if explore {
+            if self.seen.iter().any(|(seen, given, text)| *seen == name && *given == args && *text == output.text) {
+                return UNCHANGED.into();
+            }
+            self.seen.push((name, args, output.text.clone()));
+        }
+        output.text.clone()
+    }
+}
+
+fn finish(session: &mut Session, turn: usize, call: &ToolCall, output: Output, text: String) {
     session.emit(Event::ToolEnd {
         turn,
         id: call.id.clone(),
         ok: output.ok,
-        output: output.text.clone(),
+        output: output.text,
         diffs: output.diffs,
         image: output.image,
     });
-    let text = if output.ok { output.text } else { format!("Error: {}", output.text) };
     session.push(Message::tool(call.id.clone(), text));
 }
 
@@ -540,6 +584,49 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_call_sent_again_is_called_out() {
+        let root = temp("repeat");
+        let script = Script::new(vec![
+            vec![call("c1", "read_file", r#"{"path":"missing.txt"}"#)],
+            vec![call("c2", "read_file", r#"{ "path": "missing.txt" }"#)],
+            vec![Stream::Content("ok".into())],
+        ]);
+        let (handle, rx) = start(&root);
+        let input = Input { text: "go".into(), images: Vec::new() };
+        handle.send(Op::Turn { turn: 0, input, context: context(script.clone(), &root, Access::Full), cancel: Arc::default() });
+        assert_eq!(until_finished(&rx, |_| {}), Outcome::Done);
+        let seen = script.seen.lock().unwrap();
+        assert!(!seen[1].messages.last().unwrap().content.contains(REPEATED));
+        assert!(seen[2].messages.last().unwrap().content.ends_with(REPEATED));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reading_the_same_unchanged_lines_again_says_so() {
+        let root = temp("reread");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        let read = r#"{"path":"a.txt","start_line":2}"#;
+        let script = Script::new(vec![
+            vec![call("c1", "read_file", read)],
+            vec![call("c2", "read_file", read)],
+            vec![call("c3", "edit_file", r#"{"path":"a.txt","old_text":"two","new_text":"2"}"#)],
+            vec![call("c4", "read_file", read)],
+            vec![Stream::Content("ok".into())],
+        ]);
+        let (handle, rx) = start(&root);
+        let input = Input { text: "go".into(), images: Vec::new() };
+        handle.send(Op::Turn { turn: 0, input, context: context(script.clone(), &root, Access::Full), cancel: Arc::default() });
+        assert_eq!(until_finished(&rx, |_| {}), Outcome::Done);
+        let seen = script.seen.lock().unwrap();
+        let last = |index: usize| seen[index].messages.last().unwrap().content.clone();
+        assert!(last(1).contains("two"));
+        assert_eq!(last(2), UNCHANGED);
+        assert!(last(4).contains("2"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn parser_failures_are_the_ones_retried() {
         assert!(malformed_output("The model produced output that does not match the expected peg-native format"));
         assert!(malformed_output("Failed to parse input at pos 12"));
@@ -619,8 +706,8 @@ mod tests {
     fn stopping_answers_every_open_call() {
         let root = temp("stop");
         let script = Script::new(vec![vec![
-            Stream::ToolCall { index: 0, id: Some("a".into()), name: Some("shell".into()), arguments: r#"{"command":"echo 1"}"#.into() },
-            Stream::ToolCall { index: 1, id: Some("b".into()), name: Some("shell".into()), arguments: r#"{"command":"echo 2"}"#.into() },
+            Stream::ToolCall { index: 0, id: Some("a".into()), name: Some("shell".into()), arguments: r#"{"command":"npm run a"}"#.into() },
+            Stream::ToolCall { index: 1, id: Some("b".into()), name: Some("shell".into()), arguments: r#"{"command":"npm run b"}"#.into() },
         ]]);
         let (handle, rx) = start(&root);
         let cancel = Arc::new(AtomicBool::new(false));

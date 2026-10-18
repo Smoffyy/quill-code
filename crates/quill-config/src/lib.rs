@@ -24,8 +24,8 @@ pub struct General {
 #[serde(rename_all = "snake_case")]
 pub enum Reasoning {
     Expanded,
-    #[default]
     Collapsed,
+    #[default]
     Hidden,
 }
 
@@ -38,7 +38,7 @@ pub struct Appearance {
 
 impl Default for Appearance {
     fn default() -> Self {
-        Appearance { reasoning: Reasoning::Collapsed, group_exploration: false }
+        Appearance { reasoning: Reasoning::Hidden, group_exploration: true }
     }
 }
 
@@ -250,7 +250,7 @@ mod tests {
         let settings = parse(old).unwrap();
         assert_eq!(settings.general.worktrees_dir, Some(PathBuf::from("D:\\trees")));
         assert_eq!(settings.appearance.reasoning, Reasoning::Hidden);
-        assert!(!settings.appearance.group_exploration);
+        assert!(settings.appearance.group_exploration);
         let saved = serde_json::to_string(&settings).unwrap();
         assert!(!saved.contains("theme") && !saved.contains("projects"));
     }

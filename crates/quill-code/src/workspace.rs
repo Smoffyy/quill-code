@@ -482,10 +482,16 @@ impl Workspace {
         let (id, turn) = (run.thread, run.turn);
         if let Some(tool) = self.thread_mut(id).and_then(|t| t.turns.get_mut(turn)).and_then(|t| t.tool_mut(&pending.id)) {
             tool.status = ToolStatus::Running;
+            tool.started = now_ms();
         }
         if let Some((_, handle)) = &self.session {
             handle.send(Op::Decide { id: pending.id, decision });
         }
+    }
+
+    pub fn redirect(&mut self, instead: String) {
+        self.decide(Decision::Decline);
+        self.steer(instead);
     }
 
     pub fn answer(&mut self, answers: Vec<String>) {

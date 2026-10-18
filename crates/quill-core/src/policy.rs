@@ -24,7 +24,7 @@ impl Access {
 
     pub fn description(self) -> &'static str {
         match self {
-            Access::Supervised => "Checks with you before every change and command",
+            Access::Supervised => "Checks with you before every change and every command that is not read-only",
             Access::AutoEdits => "Makes edits and read-only commands on its own, checks before the rest",
             Access::Full => "Works without stopping to ask, except before fetching from the web",
         }
@@ -101,7 +101,7 @@ pub fn verdict(access: Access, effect: Effect, tool: &str, subject: &str, rules:
         Effect::Network => Verdict::Ask,
         _ if access == Access::Full => Verdict::Allow,
         Effect::Write if access == Access::AutoEdits => Verdict::Allow,
-        Effect::Execute if access == Access::AutoEdits && read_only(subject, safe_commands) => Verdict::Allow,
+        Effect::Execute if read_only(subject, safe_commands) => Verdict::Allow,
         _ => Verdict::Ask,
     }
 }
@@ -205,6 +205,8 @@ mod tests {
         assert_eq!(ask(Access::Full, Effect::ReadOutside), Verdict::Allow);
         assert_eq!(ask(Access::Full, Effect::Network), Verdict::Ask);
         assert_eq!(verdict(Access::AutoEdits, Effect::Execute, "shell", "git status", &[], &safe()), Verdict::Allow);
+        assert_eq!(verdict(Access::Supervised, Effect::Execute, "shell", "git status", &[], &safe()), Verdict::Allow);
+        assert_eq!(verdict(Access::Supervised, Effect::Execute, "shell", "npm install", &[], &safe()), Verdict::Ask);
     }
 
     #[test]

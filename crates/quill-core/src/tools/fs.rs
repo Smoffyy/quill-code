@@ -44,10 +44,33 @@ fn read_text(path: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn locate(root: &Path, args: &Value) -> Result<(PathBuf, Effect), String> {
-    let path = normalize(root, args::text(args, &PATH).unwrap_or_default())?;
+fn locate(root: &Path, rel: &str) -> Result<(PathBuf, Effect), String> {
+    let path = normalize(root, rel)?;
     let effect = if inside(&path, root) { Effect::Read } else { Effect::ReadOutside };
     Ok((path, effect))
+}
+
+fn scope(root: &Path, args: &Value) -> Result<(PathBuf, Effect, Option<GlobSet>), String> {
+    let given = args::trimmed(args, &PATH).unwrap_or_default().replace('\\', "/");
+    let (path, effect) = locate(root, &given)?;
+    if path.exists() {
+        return Ok((path, effect, None));
+    }
+    let missing = || format!("{} does not exist. Leave out \"path\" to search the whole project.", display(root, &path));
+    let Some(at) = given.find(['*', '?', '[', '{']) else { return Err(missing()) };
+    let split = given[..at].rfind('/').map_or(0, |slash| slash + 1);
+    let (base, effect) = locate(root, &given[..split])?;
+    if !base.exists() {
+        return Err(missing());
+    }
+    Ok((base, effect, Some(glob_set(&given[split..])?)))
+}
+
+fn searched(what: String, args: &Value) -> String {
+    match args::trimmed(args, &PATH) {
+        Some(path) => format!("\"{what}\" in {}", path.replace('\\', "/")),
+        None => what,
+    }
 }
 
 fn reading(effect: Effect, path: &Path, action: Action) -> Prepared {
@@ -60,7 +83,9 @@ fn reading(effect: Effect, path: &Path, action: Action) -> Prepared {
 fn glob_set(pattern: &str) -> Result<GlobSet, String> {
     let mut builder = GlobSetBuilder::new();
     for part in pattern.split(',').map(str::trim).filter(|part| !part.is_empty()) {
-        let glob = GlobBuilder::new(&part.replace('\\', "/")).case_insensitive(true).build().map_err(|e| e.to_string())?;
+        let part = part.replace('\\', "/");
+        let part = if part.contains(['*', '?', '[', '{']) { part } else { format!("**/*{part}*") };
+        let glob = GlobBuilder::new(&part).case_insensitive(true).build().map_err(|e| e.to_string())?;
         builder.add(glob);
     }
     builder.build().map_err(|e| e.to_string())
@@ -104,13 +129,13 @@ impl Tool for FindFiles {
     }
 
     fn target(&self, args: &Value) -> String {
-        args::trimmed(args, &PATTERN).unwrap_or_default().to_string()
+        searched(args::trimmed(args, &PATTERN).unwrap_or_default().to_string(), args)
     }
 
     fn prepare(&self, args: &Value, ctx: &Ctx<'_>) -> Result<Prepared, String> {
         let pattern = args::trimmed(args, &PATTERN).ok_or("find_files needs a \"pattern\", such as **/*.rs.")?.to_string();
         let set = glob_set(&pattern)?;
-        let (dir, effect) = locate(ctx.root, args)?;
+        let (dir, effect, within) = scope(ctx.root, args)?;
         let root = ctx.root.to_path_buf();
         let shown = dir.clone();
         Ok(reading(
@@ -121,7 +146,7 @@ impl Tool for FindFiles {
                 let mut extra = 0;
                 for path in files(&dir, ctx.limits) {
                     let rel = display(&dir, &path);
-                    if set.is_match(&rel) {
+                    if set.is_match(&rel) && within.as_ref().is_none_or(|within| within.is_match(&rel)) {
                         if found.len() < ctx.limits.max_matches {
                             found.push(display(&root, &path));
                         } else {
@@ -130,7 +155,9 @@ impl Tool for FindFiles {
                     }
                 }
                 if found.is_empty() {
-                    return Output::ok(format!("No files match \"{pattern}\"."));
+                    return Output::ok(format!(
+                        "No files match \"{pattern}\". find_files matches file names and paths; to search inside files, use grep."
+                    ));
                 }
                 if extra > 0 {
                     found.push(format!("... and {extra} more files. Use a narrower pattern."));
@@ -177,7 +204,7 @@ impl Tool for Grep {
     }
 
     fn target(&self, args: &Value) -> String {
-        args::text(args, &PATTERN).unwrap_or_default().to_string()
+        searched(args::text(args, &PATTERN).unwrap_or_default().to_string(), args)
     }
 
     fn prepare(&self, args: &Value, ctx: &Ctx<'_>) -> Result<Prepared, String> {
@@ -190,7 +217,7 @@ impl Tool for Grep {
             .map_err(|e| e.to_string())?;
         let filter = args::trimmed(args, &GLOB).map(glob_set).transpose()?;
         let context = args::number(args, &["context", "context_lines", "-C"]).unwrap_or(0).min(5) as usize;
-        let (base, effect) = locate(ctx.root, args)?;
+        let (base, effect, within) = scope(ctx.root, args)?;
         let root = ctx.root.to_path_buf();
         let shown = base.clone();
         Ok(reading(
@@ -202,7 +229,8 @@ impl Tool for Grep {
                 let mut matches = 0;
                 let mut extra = 0;
                 for file in candidates {
-                    if filter.as_ref().is_some_and(|set| !set.is_match(display(&base, &file))) {
+                    let rel = display(&base, &file);
+                    if [&filter, &within].into_iter().flatten().any(|set| !set.is_match(&rel)) {
                         continue;
                     }
                     if fs::metadata(&file).map_or(true, |m| m.len() > MAX_FILE) {
@@ -291,8 +319,8 @@ impl Tool for ReadFile {
     }
 
     fn prepare(&self, args: &Value, ctx: &Ctx<'_>) -> Result<Prepared, String> {
-        args::trimmed(args, &PATH).ok_or("read_file needs a \"path\".")?;
-        let (path, effect) = locate(ctx.root, args)?;
+        let rel = args::trimmed(args, &PATH).ok_or("read_file needs a \"path\".")?;
+        let (path, effect) = locate(ctx.root, rel)?;
         let (start, end) = span(args);
         let root = ctx.root.to_path_buf();
         let shown = path.clone();
@@ -462,8 +490,8 @@ const EDIT: Spec = Spec {
     active: "Editing",
     done: "Edited",
     parallel: false,
-    description: "Replace exact text in a file. old_text must match the file exactly, including spaces, and appear once unless replace_all is true. To make several changes to one file at once, pass edits: a list of {old_text, new_text, replace_all}. All edits apply or none do.",
-    guide: "edit_file replaces exact text in a file. Copy old_text exactly from read_file output, taking only what comes after the → on each line (the indentation after it is real), with enough surrounding lines to make it unique. Pass edits to change several places at once.",
+    description: "Replace exact text in a file with new_text. old_text must match the file exactly, including spaces, and appear once unless replace_all is true. To add code, set old_text to the line it goes after and new_text to that line followed by the new code.",
+    guide: "edit_file replaces old_text in a file with new_text; always send both. Copy old_text exactly from read_file output, taking only what comes after the → on each line (the indentation after it is real), with enough surrounding lines to make it unique. To add code, set old_text to the line it goes after and new_text to that same line followed by the new code.",
 };
 
 impl Tool for EditFile {
@@ -478,22 +506,9 @@ impl Tool for EditFile {
                 "path": { "type": "string", "description": "File path relative to the project root." },
                 "old_text": { "type": "string", "description": "Exact text to replace, copied from the file." },
                 "new_text": { "type": "string", "description": "Replacement text. Use an empty string to delete." },
-                "replace_all": { "type": "boolean", "description": "Replace every occurrence." },
-                "edits": {
-                    "type": "array",
-                    "description": "Several replacements in one file, applied in order.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "old_text": { "type": "string" },
-                            "new_text": { "type": "string" },
-                            "replace_all": { "type": "boolean" }
-                        },
-                        "required": ["old_text", "new_text"]
-                    }
-                }
+                "replace_all": { "type": "boolean", "description": "Replace every occurrence." }
             },
-            "required": ["path"]
+            "required": ["path", "old_text", "new_text"]
         })
     }
 
@@ -519,7 +534,9 @@ impl Tool for EditFile {
 fn edits(args: &Value) -> Result<Vec<(String, String, bool)>, String> {
     let one = |value: &Value| -> Result<(String, String, bool), String> {
         let old = args::text(value, &OLD).ok_or("edit_file needs \"old_text\", copied exactly from the file.")?;
-        let new = args::text(value, &NEW).ok_or("edit_file needs \"new_text\". Use an empty string to delete.")?;
+        let new = args::text(value, &NEW).ok_or(
+            "edit_file needs \"new_text\", the text that takes the place of old_text. To add code, set old_text to the line it goes after and new_text to that line followed by the new code. Use an empty string to delete.",
+        )?;
         Ok((old.replace(NEWLINE_NOTE, ""), new.replace(NEWLINE_NOTE, ""), args::flag(value, &["replace_all", "all"])))
     };
     match args.get("edits").and_then(Value::as_array) {
@@ -716,6 +733,31 @@ mod tests {
         assert!(run(&ReadFile, &root, json!({ "path": "src/a.txt" })).unwrap().text.contains("    1→hello"));
         assert!(run(&Grep, &root, json!({ "pattern": "HELLO" })).unwrap().text.contains("src/a.txt:1: hello"));
         assert!(run(&FindFiles, &root, json!({ "pattern": "**/*.txt" })).unwrap().text.contains("src/a.txt"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn globs_given_as_the_path_filter_the_search() {
+        let root = temp_root("globpath");
+        fs::create_dir_all(root.join("source")).unwrap();
+        fs::write(root.join("source/Note.hx"), "var rating = \"sick\";").unwrap();
+        fs::write(root.join("notes.txt"), "sick").unwrap();
+        let found = run(&Grep, &root, json!({ "pattern": "sick", "path": "**/*.hx" })).unwrap().text;
+        assert_eq!(found, "source/Note.hx:1: var rating = \"sick\";");
+        let named = run(&FindFiles, &root, json!({ "pattern": "*Note*", "path": "source/**" })).unwrap().text;
+        assert_eq!(named, "source/Note.hx");
+        assert_eq!(run(&FindFiles, &root, json!({ "pattern": "note", "path": "source" })).unwrap().text, "source/Note.hx");
+        assert!(run(&Grep, &root, json!({ "pattern": "sick", "path": "src" })).unwrap_err().contains("src does not exist"));
+        assert_eq!(Grep.target(&json!({ "pattern": "sick", "path": "source\\" })), "\"sick\" in source/");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn edits_without_new_text_explain_how_to_insert() {
+        let root = temp_root("nonew");
+        fs::write(root.join("a.txt"), "one\n").unwrap();
+        let error = run(&EditFile, &root, json!({ "path": "a.txt", "old_text": "one" })).unwrap_err();
+        assert!(error.contains("To add code"), "{error}");
         fs::remove_dir_all(&root).unwrap();
     }
 

@@ -99,6 +99,7 @@ pub struct App {
     highlighted: usize,
     files: Option<(PathBuf, Vec<String>)>,
     choice: usize,
+    instead: String,
     view: Option<View>,
     out: Vec<Line>,
     queued: Option<Prompt>,
@@ -145,7 +146,7 @@ fn help() -> Vec<Line> {
         ("enter", "send, or steer the reply while Quill works"),
         ("shift+enter", "new line (alt+enter and ctrl+j work too)"),
         ("shift+tab", "switch between Ask first, Trust edits and Autopilot"),
-        ("ctrl+o", "show thoughts in full, or as a summary"),
+        ("ctrl+o", "show or hide the model's thoughts"),
         ("page up/down", "scroll the conversation; the mouse wheel works too"),
         ("esc", "stop the reply, close a menu"),
         ("ctrl+c", "clear the prompt or stop; press twice to quit"),
@@ -187,6 +188,7 @@ impl App {
             highlighted: 0,
             files: None,
             choice: 0,
+            instead: String::new(),
             view: None,
             out: Vec::new(),
             queued: None,
@@ -296,12 +298,12 @@ impl App {
 
     fn toggle_thoughts(&mut self) {
         let expand = self.config.settings.appearance.reasoning != Reasoning::Expanded;
-        let next = if expand { Reasoning::Expanded } else { Reasoning::Collapsed };
+        let next = if expand { Reasoning::Expanded } else { Reasoning::Hidden };
         self.config.update(|settings| settings.appearance.reasoning = next);
         self.notice(if expand {
-            "Thoughts now show in full. ctrl+o summarises them again."
+            "Thoughts now show in full. ctrl+o hides them again."
         } else {
-            "Thoughts now show as a summary. ctrl+o shows them in full."
+            "Thoughts are hidden. ctrl+o shows them in full."
         });
     }
 
@@ -707,12 +709,15 @@ impl App {
             Some(Overlay::Branch(picker, _)) => picker.paste(text),
             Some(Overlay::Version(picker)) => picker.paste(text),
             Some(Overlay::Think(_) | Overlay::Mode(_) | Overlay::Trust(_)) => {}
-            None if self.workspace.pending().is_some() => {}
+            None if self.workspace.pending().is_some() => {
+                self.instead.push_str(&text.replace(['\r', '\n'], " "));
+                self.choice = self.approval_choices().len();
+            }
             None if self.workspace.asked().is_some() => {
                 if let Some(asked) = self.workspace.asked_mut() {
                     let current = asked.current;
                     asked.highlight[current] = asked.other_row();
-                    asked.typed[current].push_str(text.trim());
+                    asked.typed[current].push_str(&text.replace(['\r', '\n'], " "));
                     asked.picked[current] = None;
                 }
             }
@@ -750,26 +755,53 @@ impl App {
 
     fn approval_key(&mut self, key: KeyEvent) {
         let choices = self.approval_choices();
-        let count = choices.len();
+        let rows = choices.len() + 1;
+        let typing = self.choice == choices.len();
+        let plain = !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         let decision = match key.code {
             KeyCode::Up => {
-                self.choice = (self.choice + count - 1) % count;
+                self.choice = (self.choice + rows - 1) % rows;
                 None
             }
             KeyCode::Down | KeyCode::Tab => {
-                self.choice = (self.choice + 1) % count;
+                self.choice = (self.choice + 1) % rows;
+                None
+            }
+            KeyCode::Enter if typing => {
+                let text = self.instead.trim().to_string();
+                if !text.is_empty() {
+                    self.workspace.redirect(text);
+                    self.settle_approval();
+                }
                 None
             }
             KeyCode::Enter => choices.get(self.choice).map(|(_, decision)| *decision),
             KeyCode::Esc => Some(Decision::Decline),
-            KeyCode::Char(c) => c.to_digit(10).and_then(|n| choices.get((n as usize).checked_sub(1)?)).map(|(_, decision)| *decision),
+            KeyCode::Backspace => {
+                self.instead.pop();
+                self.choice = choices.len();
+                None
+            }
+            KeyCode::Char(c) if self.instead.is_empty() && c.is_ascii_digit() => {
+                c.to_digit(10).and_then(|n| choices.get((n as usize).checked_sub(1)?)).map(|(_, decision)| *decision)
+            }
+            KeyCode::Char(c) if plain => {
+                self.instead.push(c);
+                self.choice = choices.len();
+                None
+            }
             _ => None,
         };
         if let Some(decision) = decision {
             self.workspace.decide(decision);
-            self.choice = 0;
-            self.advance();
+            self.settle_approval();
         }
+    }
+
+    fn settle_approval(&mut self) {
+        self.instead.clear();
+        self.choice = 0;
+        self.advance();
     }
 
     fn question_key(&mut self, key: KeyEvent) -> bool {
@@ -801,6 +833,12 @@ impl App {
                 asked.highlight[current] = other;
                 asked.typed[current].pop();
                 asked.picked[current] = asked.picked[current].filter(|picked| *picked != other);
+            }
+            KeyCode::Char(c) if plain && asked.typed[current].is_empty() && c.is_ascii_digit() => {
+                if let Some(row) = c.to_digit(10).and_then(|n| (n as usize).checked_sub(1)).filter(|row| *row < other) {
+                    asked.highlight[current] = row;
+                    asked.picked[current] = Some(row);
+                }
             }
             KeyCode::Char(c) if plain => {
                 asked.highlight[current] = other;
@@ -1458,9 +1496,14 @@ impl App {
 
     fn approval_card(&self, look: Look) -> Vec<Line> {
         let Some(pending) = self.workspace.pending() else { return Vec::new() };
-        let mut lines = vec![Line::styled(format!("! {}", pending.approval.title), warn().bold())];
-        for line in wrap(&Line::plain(pending.approval.subject.trim()), self.width.saturating_sub(2)).into_iter().take(4) {
-            lines.push(Line::plain("  ").with_line(line));
+        let mut lines =
+            vec![Line::styled("─".repeat(self.width), accent()), Line::styled(format!(" {}", pending.approval.title), accent().bold())];
+        for line in wrap(&Line::styled(pending.approval.subject.trim(), dim()), self.width.saturating_sub(2)).into_iter().take(4) {
+            lines.push(Line::plain(" ").with_line(line));
+        }
+        let dashes = Line::styled("╌".repeat(self.width), dim());
+        if !pending.approval.diffs.is_empty() {
+            lines.push(dashes.clone());
         }
         let mut shown = 0;
         for diff in &pending.approval.diffs {
@@ -1474,12 +1517,28 @@ impl App {
             shown += rows.len();
             lines.extend(rows);
         }
-        for (index, (label, _)) in self.approval_choices().iter().enumerate() {
+        if !pending.approval.diffs.is_empty() {
+            lines.push(dashes);
+        }
+        let choices = self.approval_choices();
+        for (index, (label, _)) in choices.iter().enumerate() {
             let on = index == self.choice;
             let mark = if on { Line::styled("▸ ", accent()) } else { Line::plain("  ") };
             lines.push(mark.with(format!("{}. ", index + 1), dim()).with(label, if on { bold() } else { plain() }));
         }
-        lines.push(Line::styled("  enter choose · esc deny · ctrl+c stops the reply", dim()));
+        let typing = self.choice == choices.len();
+        let mut row = if typing { Line::styled("▸ ", accent()) } else { Line::plain("  ") };
+        row.push(format!("{}. ", choices.len() + 1), dim());
+        if self.instead.is_empty() {
+            row.push("No, and tell Quill what to do instead", if typing { bold() } else { plain() });
+        } else {
+            row.push(self.instead.as_str(), bold());
+        }
+        if typing {
+            row.push(" ", plain().reverse());
+        }
+        lines.push(truncate(&row, self.width));
+        lines.push(Line::styled("  enter choose · type to say what to do instead · esc deny", dim()));
         lines
     }
 
@@ -1529,7 +1588,7 @@ impl App {
             }
             lines.push(truncate(&row, self.width));
         }
-        let mut hint = "  ↑↓ choose · enter selects · enter again confirms".to_string();
+        let mut hint = "  ↑↓ or a number · enter selects · enter again confirms".to_string();
         if count > 1 {
             hint.push_str(" · ←→ switch question");
         }

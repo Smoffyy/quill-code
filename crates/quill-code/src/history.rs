@@ -48,7 +48,7 @@ pub fn plan(turn: &Turn) -> Option<(&[PlanStep], Option<&str>)> {
     })
 }
 
-fn explored(tools: &[&ToolItem], working: bool) -> String {
+fn explored(tools: &[&ToolItem], working: bool) -> Line {
     let mut kinds: Vec<(&str, usize)> = Vec::new();
     for tool in tools {
         let kind = match tool.tool.as_str() {
@@ -63,24 +63,30 @@ fn explored(tools: &[&ToolItem], working: bool) -> String {
             None => kinds.push((kind, 1)),
         }
     }
-    let phrases: Vec<String> = kinds.iter().map(|(kind, count)| phrase(kind, *count, working)).collect();
-    let mut text = phrases.join(", ");
-    if let Some(first) = text.get_mut(..1) {
-        first.make_ascii_uppercase();
+    let mut line = Line::default();
+    for (index, (kind, count)) in kinds.iter().enumerate() {
+        let (done, active, word) = match *kind {
+            "read" => ("read", "reading", "file"),
+            "search" => ("searched for", "searching for", "pattern"),
+            "list" => ("listed", "listing", "folder"),
+            "run" => ("ran", "running", "shell command"),
+            _ => ("looked up", "looking up", "lookup"),
+        };
+        let mut verb = if working { active } else { done }.to_string();
+        if index == 0 {
+            verb[..1].make_ascii_uppercase();
+        } else {
+            verb.insert_str(0, ", ");
+        }
+        counted(&mut line, &verb, *count, word);
     }
-    text
+    line
 }
 
-fn phrase(kind: &str, count: usize, working: bool) -> String {
-    let (done, active, one, many) = match kind {
-        "read" => ("read", "reading", "file", "files"),
-        "search" => ("searched for", "searching for", "pattern", "patterns"),
-        "list" => ("listed", "listing", "folder", "folders"),
-        "run" => ("ran", "running", "shell command", "shell commands"),
-        _ => ("looked up", "looking up", "lookup", "lookups"),
-    };
-    let verb = if working { active } else { done };
-    format!("{verb} {count} {}", if count == 1 { one } else { many })
+fn counted(line: &mut Line, lead: &str, count: usize, word: &str) {
+    line.push(format!("{lead} "), dim());
+    line.push(count.to_string(), bold());
+    line.push(if count == 1 { format!(" {word}") } else { format!(" {word}s") }, dim());
 }
 
 fn seconds_label(seconds: f32) -> String {
@@ -224,29 +230,30 @@ fn plural(count: usize, word: &str) -> String {
     if count == 1 { format!("{count} {word}") } else { format!("{count} {word}s") }
 }
 
-fn changed(diffs: &[FileDiff]) -> String {
+fn changed(diffs: &[FileDiff]) -> Line {
     let added: usize = diffs.iter().map(|diff| diff.added).sum();
     let removed: usize = diffs.iter().map(|diff| diff.removed).sum();
+    let mut line = Line::default();
     if let [diff] = diffs
         && diff.created
     {
-        return format!("Wrote {} to {}", plural(added, "line"), diff.path);
+        counted(&mut line, "Wrote", added, "line");
+        line.push(format!(" to {}", diff.path), dim());
+        return line;
     }
-    let subject = match diffs {
-        [diff] => diff.path.clone(),
-        _ => format!("{} files", diffs.len()),
-    };
-    let mut parts = Vec::new();
     if added > 0 {
-        parts.push(plural(added, "addition"));
+        counted(&mut line, "Added", added, "line");
     }
     if removed > 0 {
-        parts.push(plural(removed, "removal"));
+        counted(&mut line, if added > 0 { ", removed" } else { "Removed" }, removed, "line");
     }
-    if parts.is_empty() {
-        return format!("Updated {subject}");
+    if line.width() == 0 {
+        line.push("No lines changed", dim());
     }
-    format!("Updated {subject} with {}", parts.join(" and "))
+    if diffs.len() > 1 {
+        line.push(format!(" in {} files", diffs.len()), dim());
+    }
+    line
 }
 
 pub fn diff_lines(diff: &FileDiff, limit: usize, look: Look) -> Vec<Line> {
@@ -284,13 +291,24 @@ pub fn diff_lines(diff: &FileDiff, limit: usize, look: Look) -> Vec<Line> {
 }
 
 fn explored_output(tool: &ToolItem, output: &str) -> String {
-    let count = output.trim_end().lines().count();
-    if tool.tool == "read_file" { format!("Read {}", plural(count, "line")) } else { format!("Found {}", plural(count, "line")) }
+    let lines: Vec<&str> = output.trim_end().lines().collect();
+    let more = lines.last().and_then(|line| line.strip_prefix("... and ")?.split(' ').next()?.parse::<usize>().ok());
+    let found = lines.iter().filter(|line| **line != "--").count() - usize::from(more.is_some()) + more.unwrap_or(0);
+    match tool.tool.as_str() {
+        "read_file" => format!(
+            "Read {}",
+            plural(lines.iter().filter(|line| line.trim_start().starts_with(|c: char| c.is_ascii_digit())).count(), "line")
+        ),
+        "find_files" if output.starts_with("No files match") => "No files found".into(),
+        "find_files" => format!("Found {}", plural(found, "file")),
+        _ if output.starts_with("No matches") => "No matches".into(),
+        _ => format!("Found {}", plural(found, "line")),
+    }
 }
 
 pub fn tool_body(tool: &ToolItem, look: Look) -> Vec<Line> {
     if !tool.diffs.is_empty() {
-        let mut lines = connect(vec![Line::styled(changed(&tool.diffs), dim())], look);
+        let mut lines = connect(vec![changed(&tool.diffs)], look);
         for diff in &tool.diffs {
             if tool.diffs.len() > 1 {
                 lines.push(Line::styled(format!("     {}", diff.path), dim()));
@@ -333,12 +351,13 @@ fn grouped(tool: &ToolItem) -> bool {
     }
 }
 
-fn group_span(items: &[Item], start: usize) -> (usize, usize) {
+fn group_span(items: &[Item], start: usize, look: Look) -> (usize, usize) {
     let mut end = start;
     for (index, item) in items.iter().enumerate().skip(start) {
         match item {
             Item::Tool(tool) if hidden_tool(tool) => {}
             Item::Tool(tool) if grouped(tool) => end = index + 1,
+            Item::Reasoning(_) if look.reasoning == Reasoning::Hidden => {}
             Item::Text(text) | Item::Reasoning(text) if blank(text) => {}
             _ => return (end, index),
         }
@@ -360,7 +379,7 @@ pub fn group_rows(tools: &[&ToolItem], look: Look, spinner: &str) -> Vec<Line> {
     let working = tools.iter().any(|tool| tool.working());
     let failed = tools.iter().filter(|tool| tool.status == ToolStatus::Failed).count();
     let mut head = if working { Line::styled(format!("{spinner} "), accent()) } else { Line::plain("  ") };
-    head.push(explored(tools, working), dim());
+    head.append(explored(tools, working));
     if failed > 0 {
         head.push(format!(" ({failed} failed)"), bad());
     }
@@ -636,7 +655,7 @@ impl Progress {
                 }
                 Item::Tool(tool) if hidden_tool(tool) => {}
                 Item::Tool(tool) if look.group && grouped(tool) => {
-                    let (end, scanned) = group_span(&turn.items, self.item);
+                    let (end, scanned) = group_span(&turn.items, self.item, look);
                     let tools = group_tools(&turn.items[self.item..end]);
                     let closed = scanned < turn.items.len() || !working;
                     if !closed || tools.iter().any(|tool| tool.working()) {
@@ -723,7 +742,7 @@ impl Progress {
                 },
                 Item::Tool(tool) if hidden_tool(tool) => {}
                 Item::Tool(tool) if look.group && grouped(tool) => {
-                    let (end, _) = group_span(&turn.items, index);
+                    let (end, _) = group_span(&turn.items, index, look);
                     lines.extend(group_rows(&group_tools(&turn.items[index..end]), look, spinner));
                     index = end;
                     continue;
@@ -822,6 +841,17 @@ mod tests {
     }
 
     #[test]
+    fn hidden_thoughts_do_not_split_a_group() {
+        let mut turn = Turn::new("p".into(), Vec::new());
+        turn.items.push(tool("1", "read_file", "a.rs", ToolStatus::Done));
+        turn.push_reasoning("Now search.");
+        turn.items.push(tool("2", "grep", "TODO", ToolStatus::Done));
+        turn.finish(TurnState::Done);
+        let lines = texts(&Progress::new().advance(&turn, Look { reasoning: Reasoning::Hidden, ..look() }));
+        assert_eq!(lines[1], "  Read 1 file, searched for 1 pattern");
+    }
+
+    #[test]
     fn edits_show_their_diff() {
         let mut turn = Turn::new("p".into(), Vec::new());
         let mut item = ToolItem::new(legacy("write_file"));
@@ -833,7 +863,7 @@ mod tests {
         turn.finish(TurnState::Done);
         let lines = texts(&Progress::new().advance(&turn, look()));
         assert_eq!(lines[1], "● Write(a.py)");
-        assert_eq!(lines[2], "  └ Updated a.py with 1 addition and 1 removal");
+        assert_eq!(lines[2], "  └ Added 1 line, removed 1 line");
         assert_eq!(lines[3].trim(), "1 - x");
         assert_eq!(lines[4].trim(), "1 + y");
         assert!(lines.iter().any(|line| line == "1 file changed +1 -1"));
@@ -846,11 +876,25 @@ mod tests {
         item.id = "1".into();
         item.target = "src/a.rs".into();
         item.status = ToolStatus::Done;
-        item.output = "one\ntwo\nthree".into();
+        item.output = "    1→one\n    2\n    3→three\n(showing lines 1-3 of 9; pass start_line to read more)".into();
         turn.items.push(Item::Tool(item));
         turn.finish(TurnState::Done);
         let lines = texts(&Progress::new().advance(&turn, Look { group: false, ..look() }));
         assert_eq!(lines[1..3], ["● Read(src/a.rs)".to_string(), "  └ Read 3 lines".to_string()]);
+    }
+
+    #[test]
+    fn searches_say_what_they_found() {
+        let searched = |name: &str, output: &str| {
+            let mut item = ToolItem::new(legacy(name));
+            item.status = ToolStatus::Done;
+            item.output = output.into();
+            texts(&tool_body(&item, look()))[0].clone()
+        };
+        assert_eq!(searched("grep", "No matches for \"sick\"."), "  └ No matches");
+        assert_eq!(searched("grep", "a.hx:1: sick\n--\na.hx:9: sick\n... and 4 more matches. Narrow it."), "  └ Found 6 lines");
+        assert_eq!(searched("find_files", "No files match \"*.hx\". Use grep."), "  └ No files found");
+        assert_eq!(searched("find_files", "a.hx\nb.hx"), "  └ Found 2 files");
     }
 
     #[test]

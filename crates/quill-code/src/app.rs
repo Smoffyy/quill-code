@@ -126,6 +126,23 @@ fn rule(width: usize) -> Line {
     Line::styled("─".repeat(width), dim())
 }
 
+fn typing_row(row: &mut Line, typed: &str, placeholder: &str, focused: bool, resting: ContentStyle) {
+    if !typed.is_empty() {
+        row.push(typed, bold());
+        if focused {
+            row.push(" ", plain().reverse());
+        }
+        return;
+    }
+    match placeholder.chars().next().filter(|_| focused) {
+        Some(first) => {
+            row.push(first.to_string(), dim().reverse());
+            row.push(&placeholder[first.len_utf8()..], dim());
+        }
+        None => row.push(placeholder, resting),
+    }
+}
+
 fn mode_style(access: Access) -> ContentStyle {
     let style = match access {
         Access::Supervised => good(),
@@ -156,7 +173,7 @@ fn help() -> Vec<Line> {
         ("@path", "bring in a file; images go to models that can see them"),
     ];
     for (key, action) in keys {
-        lines.push(Line::plain(format!("  {}", pad(key, 13))).with(action, dim()));
+        lines.push(Line::plain(format!("  {}", pad(key, Command::widest() + 3))).with(action, dim()));
     }
     lines.push(Line::default());
     lines.push(Line::styled("Paste or drag a file path into the prompt to attach the file.", dim()));
@@ -224,11 +241,13 @@ impl App {
 
     fn notice(&mut self, text: impl Into<String>) {
         let lines = wrap(&Line::styled(text.into(), dim()), self.width.saturating_sub(2));
+        self.out.push(Line::default());
         self.out.extend(indent(lines, Line::styled("· ", dim()), Line::plain("  ")));
     }
 
     fn problem(&mut self, text: impl Into<String>) {
         let lines = wrap(&Line::styled(text.into(), bad()), self.width.saturating_sub(2));
+        self.out.push(Line::default());
         self.out.extend(indent(lines, Line::styled("! ", bad()), Line::plain("  ")));
     }
 
@@ -451,9 +470,14 @@ impl App {
                 }
             }
             Msg::Job(job) => {
-                if let Some(Overlay::Commit(flow)) = &mut self.overlay
-                    && flow.job(job, &mut self.out) == Update::Close
-                {
+                let Some(Overlay::Commit(flow)) = &mut self.overlay else { return };
+                let mut lines = Vec::new();
+                let update = flow.job(job, &mut lines);
+                if !lines.is_empty() {
+                    self.out.push(Line::default());
+                    self.out.append(&mut lines);
+                }
+                if update == Update::Close {
                     self.overlay = None;
                     self.refresh_repo();
                 }
@@ -1529,14 +1553,7 @@ impl App {
         let typing = self.choice == choices.len();
         let mut row = if typing { Line::styled("▸ ", accent()) } else { Line::plain("  ") };
         row.push(format!("{}. ", choices.len() + 1), dim());
-        if self.instead.is_empty() {
-            row.push("No, and tell Quill what to do instead", if typing { bold() } else { plain() });
-        } else {
-            row.push(self.instead.as_str(), bold());
-        }
-        if typing {
-            row.push(" ", plain().reverse());
-        }
+        typing_row(&mut row, &self.instead, "No, and tell Quill what to do instead", typing, plain());
         lines.push(truncate(&row, self.width));
         lines.push(Line::styled("  enter choose · type to say what to do instead · esc deny", dim()));
         lines
@@ -1570,16 +1587,10 @@ impl App {
             let mut row = if on { Line::styled("▸ ", accent()) } else { Line::plain("  ") };
             row.push(format!("{}. ", index + 1), dim());
             let label = if index == other { typed.as_str() } else { question.options[index].as_str() };
-            if index == other && typed.is_empty() {
-                row.push("Something else", dim());
-                if on {
-                    row.push(": type your own answer", dim());
-                }
+            if index == other {
+                typing_row(&mut row, typed, "Something else", on, dim());
             } else {
                 row.push(label, if on { bold() } else { plain() });
-            }
-            if index == other && on {
-                row.push(" ", plain().reverse());
             }
             if picked == Some(index) {
                 row.push("  selected, enter again to confirm", good());
@@ -1643,6 +1654,9 @@ impl App {
             };
             activity.push(doing, if waiting || asked { warn() } else { plain() });
             activity.push(format!(" · {}", history::duration(turn.elapsed_secs())), dim());
+            if let Some(tokens) = history::generated(turn) {
+                activity.push(format!(" · {tokens}"), dim());
+            }
             activity.push(" · esc to stop", dim());
             middle.push(Line::default());
             middle.push(activity);
@@ -1661,7 +1675,7 @@ impl App {
         }
         middle.extend(approval.iter().cloned());
         middle.extend(question);
-        if !middle.is_empty() {
+        if !middle.is_empty() || !self.intro {
             middle.push(Line::default());
         }
         let mut panel = Vec::new();

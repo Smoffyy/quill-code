@@ -66,9 +66,16 @@ pub struct Flow {
 }
 
 fn write_message(root: &Path, writer: Result<Writer, String>) -> Result<String, String> {
-    let text = writer?.write(COMMIT_SYSTEM, &git::staged_diff(root, 12_000))?;
-    let text = text.trim().trim_matches('`').trim().to_string();
+    let text = tidy(&writer?.write(COMMIT_SYSTEM, &git::staged_diff(root, 12_000))?);
     if text.is_empty() { Err("The model returned an empty message. Type one yourself.".into()) } else { Ok(text) }
+}
+
+fn tidy(text: &str) -> String {
+    let text = text.trim().trim_matches('`').trim();
+    match text.split_once('\n') {
+        Some((subject, body)) if !body.trim().is_empty() => format!("{}\n\n{}", subject.trim(), body.trim_start_matches(['\r', '\n'])),
+        _ => text.to_string(),
+    }
 }
 
 impl Flow {
@@ -284,7 +291,7 @@ impl Flow {
     pub fn job(&mut self, job: Job, out: &mut Vec<Line>) -> Update {
         match job {
             Job::Committed(Ok((sha, branch))) => {
-                out.push(Line::styled("• ", good()).with("Committed ", dim()).with(format!("{sha} to {branch}"), plain()));
+                out.push(Line::styled("· ", good()).with("Committed ", dim()).with(format!("{sha} to {branch}"), plain()));
                 self.has_commits = true;
                 self.branch = Some(branch);
                 let next = self.after_choices();
@@ -301,14 +308,14 @@ impl Flow {
             }
             Job::Pushed(Ok(())) => {
                 out.push(
-                    Line::styled("• ", good())
+                    Line::styled("· ", good())
                         .with("Pushed ", dim())
                         .with(format!("{} to origin", self.branch.clone().unwrap_or_default()), plain()),
                 );
                 return Update::Close;
             }
             Job::Published(Ok(url)) => {
-                out.push(Line::styled("• ", good()).with("Published to ", dim()).with(url, accent()));
+                out.push(Line::styled("· ", good()).with("Published to ", dim()).with(url, accent()));
                 return Update::Close;
             }
             Job::Pushed(Err(error)) | Job::Published(Err(error)) => {
@@ -384,5 +391,17 @@ impl Flow {
             lines.push(truncate(&Line::styled(format!("  {error}"), bad()), width));
         }
         (lines, cursor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messages_get_a_blank_line_after_the_summary() {
+        assert_eq!(tidy("Add JSON output\n- Add a flag\n- Print totals"), "Add JSON output\n\n- Add a flag\n- Print totals");
+        assert_eq!(tidy("```\nFix the parser\n\n- Handle tabs\n```"), "Fix the parser\n\n- Handle tabs");
+        assert_eq!(tidy("  Fix the parser  "), "Fix the parser");
     }
 }

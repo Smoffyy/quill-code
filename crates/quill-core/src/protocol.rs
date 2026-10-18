@@ -88,6 +88,7 @@ pub enum Event {
     ApprovalRequested { turn: usize, id: String, approval: Approval },
     QuestionAsked { turn: usize, id: String, questions: Vec<Question> },
     PlanUpdated { turn: usize, steps: Vec<PlanStep>, explanation: Option<String> },
+    Note { turn: usize, text: String },
     Message { message: Message },
     Compacting,
     Compacted { history: Vec<Message> },

@@ -26,11 +26,11 @@ impl Look {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
-    Prompt,
-    Row,
-    Prose,
+fn block(out: &mut Vec<Line>, lines: Vec<Line>) {
+    if !lines.is_empty() {
+        out.push(Line::default());
+        out.extend(lines);
+    }
 }
 
 fn hidden_tool(tool: &ToolItem) -> bool {
@@ -42,7 +42,7 @@ fn blank(text: &str) -> bool {
 }
 
 pub fn plan(turn: &Turn) -> Option<(&[PlanStep], Option<&str>)> {
-    turn.items.iter().find_map(|item| match item {
+    turn.items.iter().rev().find_map(|item| match item {
         Item::Plan { steps, explanation } => Some((steps.as_slice(), explanation.as_deref())),
         _ => None,
     })
@@ -107,6 +107,19 @@ fn command_body(output: &str) -> &str {
         None if output.starts_with("Exit code") => "",
         _ => output,
     }
+}
+
+fn telling(output: &str) -> String {
+    let lines: Vec<&str> = output
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            let position = line.starts_with("At line:") || line.starts_with("+ ...") || line.trim_start_matches(['+', ' ', '~']).is_empty();
+            let record = line.starts_with("+ CategoryInfo") || line.starts_with("+ FullyQualifiedErrorId");
+            !line.is_empty() && !line.starts_with("at ") && !position && !record
+        })
+        .collect();
+    lines.join("\n")
 }
 
 fn target(tool: &ToolItem) -> String {
@@ -323,8 +336,11 @@ pub fn tool_body(tool: &ToolItem, look: Look) -> Vec<Line> {
         Category::Command => {
             let failed = failed || tool.exit_code().is_some_and(|code| code != 0);
             let body = command_body(&output);
-            let lines =
-                if failed { output_lines(body, FAILED_LINES, true, plain()) } else { output_lines(body, OUTPUT_LINES, true, dim()) };
+            let lines = if failed {
+                output_lines(&telling(body), FAILED_LINES, true, plain())
+            } else {
+                output_lines(body, OUTPUT_LINES, true, dim())
+            };
             connect(lines, look)
         }
         _ if failed => connect(output_lines(&output, 3, false, bad()), look),
@@ -345,7 +361,7 @@ pub fn running_command(tool: &ToolItem, look: Look) -> Vec<Line> {
 
 fn grouped(tool: &ToolItem) -> bool {
     match tool.category {
-        Category::Explore => true,
+        Category::Explore => tool.status != ToolStatus::Failed,
         Category::Command => tool.status != ToolStatus::Failed && tool.exit_code().is_none_or(|code| code == 0),
         _ => false,
     }
@@ -377,16 +393,14 @@ fn group_tools(items: &[Item]) -> Vec<&ToolItem> {
 
 pub fn group_rows(tools: &[&ToolItem], look: Look, spinner: &str) -> Vec<Line> {
     let working = tools.iter().any(|tool| tool.working());
-    let failed = tools.iter().filter(|tool| tool.status == ToolStatus::Failed).count();
     let mut head = if working { Line::styled(format!("{spinner} "), accent()) } else { Line::plain("  ") };
     head.append(explored(tools, working));
-    if failed > 0 {
-        head.push(format!(" ({failed} failed)"), bad());
-    }
     let mut lines = vec![truncate(&head, look.width)];
     for tool in tools.iter().filter(|tool| tool.working() && tool.category == Category::Command) {
         lines.extend(tool_rows(tool, look, spinner));
-        lines.extend(running_command(tool, look));
+        if tool.status == ToolStatus::Running {
+            lines.extend(running_command(tool, look));
+        }
     }
     lines
 }
@@ -456,6 +470,29 @@ fn reasoning_lines(text: &str, look: Look) -> Vec<Line> {
     }
 }
 
+fn thinking_lines(text: &str, look: Look, thought: Option<&str>) -> Vec<Line> {
+    let mut lines = Vec::new();
+    match look.reasoning {
+        Reasoning::Hidden => {}
+        Reasoning::Collapsed => {
+            lines.push(Line::styled("◇ Thinking", dim()));
+            if let Some(thought) = thought {
+                let wrapped = wrap(&Line::styled(thought, dim().italic()), look.inner(2));
+                lines.extend(indent(wrapped.into_iter().take(2).collect(), Line::plain("  "), Line::plain("  ")));
+            }
+        }
+        Reasoning::Expanded => {
+            let text = clean(text.trim());
+            let tail: Vec<&str> = text.lines().filter(|line| !blank(line)).collect();
+            lines.push(Line::styled("◇ Thinking", dim()));
+            for line in &tail[tail.len().saturating_sub(6)..] {
+                lines.push(truncate(&Line::styled(format!("  {}", line.trim()), dim().italic()), look.width));
+            }
+        }
+    }
+    lines
+}
+
 pub fn plan_lines(steps: &[PlanStep], explanation: Option<&str>, look: Look) -> Vec<Line> {
     let done = steps.iter().filter(|step| step.status == StepStatus::Done).count();
     let mut lines = vec![Line::styled("Plan", bold()).with(format!(" · {done} of {} done", steps.len()), dim())];
@@ -497,10 +534,12 @@ fn footer(turn: &Turn) -> Line {
     let millis = turn.worked_ms.unwrap_or_else(|| now_ms().saturating_sub(turn.started));
     let mut parts = vec![format!("Worked for {}", seconds_label(millis as f32 / 1000.0))];
     parts.extend(turn.model.clone());
-    if turn.usage.total() > 0 {
-        parts.push(format!("{} tokens", count(turn.usage.total())));
-    }
+    parts.extend(generated(turn));
     Line::styled(format!("  {}", parts.join(" · ")), dim())
+}
+
+pub fn generated(turn: &Turn) -> Option<String> {
+    (turn.usage.completion > 0).then(|| format!("↓ {} tokens", count(turn.usage.completion)))
 }
 
 pub fn ending_lines(turn: &Turn, look: Look) -> Vec<Line> {
@@ -528,6 +567,9 @@ pub fn ending_lines(turn: &Turn, look: Look) -> Vec<Line> {
                 .with(format!(" -{}", change.removed), bad());
             if change.created {
                 line.push(" new", dim());
+            }
+            if change.deleted {
+                line.push(" deleted", dim());
             }
             lines.push(truncate(&line, look.width));
         }
@@ -600,28 +642,16 @@ pub struct Progress {
     item: usize,
     offset: usize,
     plan: Option<Vec<PlanStep>>,
-    last: Option<Kind>,
     done: bool,
 }
 
 impl Progress {
     pub fn new() -> Progress {
-        Progress { item: 0, offset: 0, plan: None, last: Some(Kind::Prompt), done: false }
+        Progress { item: 0, offset: 0, plan: None, done: false }
     }
 
     pub fn done(&self) -> bool {
         self.done
-    }
-
-    fn block(&mut self, out: &mut Vec<Line>, kind: Kind, lines: Vec<Line>) {
-        if lines.is_empty() {
-            return;
-        }
-        if self.last.is_some_and(|last| kind == Kind::Prose || last != Kind::Row) {
-            out.push(Line::default());
-        }
-        out.extend(lines);
-        self.last = Some(kind);
     }
 
     pub fn advance(&mut self, turn: &Turn, look: Look) -> Vec<Line> {
@@ -639,7 +669,7 @@ impl Progress {
                         let chunk = &text[self.offset..end];
                         if !blank(chunk) {
                             let first = blank(&text[..self.offset]);
-                            self.block(&mut out, Kind::Prose, answer(markdown::render(chunk, look.inner(2)), first));
+                            block(&mut out, answer(markdown::render(chunk, look.inner(2)), first));
                         }
                         self.offset = end;
                     }
@@ -651,7 +681,7 @@ impl Progress {
                     if streaming {
                         break;
                     }
-                    self.block(&mut out, Kind::Row, reasoning_lines(text, look));
+                    block(&mut out, reasoning_lines(text, look));
                 }
                 Item::Tool(tool) if hidden_tool(tool) => {}
                 Item::Tool(tool) if look.group && grouped(tool) => {
@@ -661,7 +691,7 @@ impl Progress {
                     if !closed || tools.iter().any(|tool| tool.working()) {
                         break;
                     }
-                    self.block(&mut out, Kind::Row, group_rows(&tools, look, "•"));
+                    block(&mut out, group_rows(&tools, look, "•"));
                     self.item = end;
                     self.offset = 0;
                     continue;
@@ -672,11 +702,11 @@ impl Progress {
                     }
                     let mut lines = tool_rows(tool, look, "•");
                     lines.extend(tool_body(tool, look));
-                    self.block(&mut out, Kind::Row, lines);
+                    block(&mut out, lines);
                 }
                 Item::Plan { steps, explanation } => {
                     if self.plan.as_ref() != Some(steps) {
-                        self.block(&mut out, Kind::Prose, plan_lines(steps, explanation.as_deref(), look));
+                        block(&mut out, plan_lines(steps, explanation.as_deref(), look));
                         self.plan = Some(steps.clone());
                     }
                 }
@@ -684,21 +714,16 @@ impl Progress {
                     if answer.is_none() && working {
                         break;
                     }
-                    self.block(&mut out, Kind::Prose, question_lines(question, answer.as_deref(), look));
+                    block(&mut out, question_lines(question, answer.as_deref(), look));
                 }
-                Item::Steer(text) => self.block(&mut out, Kind::Prose, steer_lines(text, look)),
-                Item::Note(text) => self.block(&mut out, Kind::Row, note_lines(text, look)),
+                Item::Steer(text) => block(&mut out, steer_lines(text, look)),
+                Item::Note(text) => block(&mut out, note_lines(text, look)),
             }
             self.item += 1;
             self.offset = 0;
         }
         if !working && self.item >= turn.items.len() {
-            if let Some((steps, explanation)) = plan(turn)
-                && self.plan.as_deref() != Some(steps)
-            {
-                self.block(&mut out, Kind::Prose, plan_lines(steps, explanation, look));
-            }
-            self.block(&mut out, Kind::Prose, ending_lines(turn, look));
+            block(&mut out, ending_lines(turn, look));
             self.done = true;
         }
         out
@@ -713,50 +738,31 @@ impl Progress {
                     let start = if index == self.item { self.offset.min(text.len()) } else { 0 };
                     let rest = &text[start..];
                     if !blank(rest) {
-                        if lines.is_empty() && self.last.is_some() {
-                            lines.push(Line::default());
-                        }
                         let rendered = answer(markdown::render(rest, look.inner(2)), blank(&text[..start]));
                         let skip = rendered.len().saturating_sub(LIVE_TEXT);
-                        lines.extend(rendered.into_iter().skip(skip));
+                        block(&mut lines, rendered.into_iter().skip(skip).collect());
                     }
                 }
-                Item::Reasoning(text) if index + 1 < turn.items.len() => lines.extend(reasoning_lines(text, look)),
-                Item::Reasoning(text) => match look.reasoning {
-                    Reasoning::Hidden => {}
-                    Reasoning::Collapsed => {
-                        lines.push(Line::styled("◇ Thinking", dim()));
-                        if let Some(thought) = thought {
-                            let wrapped = wrap(&Line::styled(thought, dim().italic()), look.inner(2));
-                            lines.extend(indent(wrapped.into_iter().take(2).collect(), Line::plain("  "), Line::plain("  ")));
-                        }
-                    }
-                    Reasoning::Expanded => {
-                        let text = clean(text.trim());
-                        let tail: Vec<&str> = text.lines().filter(|line| !blank(line)).collect();
-                        lines.push(Line::styled("◇ Thinking", dim()));
-                        for line in &tail[tail.len().saturating_sub(6)..] {
-                            lines.push(truncate(&Line::styled(format!("  {}", line.trim()), dim().italic()), look.width));
-                        }
-                    }
-                },
+                Item::Reasoning(text) if index + 1 < turn.items.len() => block(&mut lines, reasoning_lines(text, look)),
+                Item::Reasoning(text) => block(&mut lines, thinking_lines(text, look, thought)),
                 Item::Tool(tool) if hidden_tool(tool) => {}
                 Item::Tool(tool) if look.group && grouped(tool) => {
                     let (end, _) = group_span(&turn.items, index, look);
-                    lines.extend(group_rows(&group_tools(&turn.items[index..end]), look, spinner));
+                    block(&mut lines, group_rows(&group_tools(&turn.items[index..end]), look, spinner));
                     index = end;
                     continue;
                 }
                 Item::Tool(tool) => {
-                    lines.extend(tool_rows(tool, look, spinner));
+                    let mut rows = tool_rows(tool, look, spinner);
                     if tool.status == ToolStatus::Running && tool.category == Category::Command {
-                        lines.extend(running_command(tool, look));
+                        rows.extend(running_command(tool, look));
                     } else if !tool.working() {
-                        lines.extend(tool_body(tool, look));
+                        rows.extend(tool_body(tool, look));
                     }
+                    block(&mut lines, rows);
                 }
-                Item::Steer(text) => lines.extend(steer_lines(text, look)),
-                Item::Note(text) => lines.extend(note_lines(text, look)),
+                Item::Steer(text) => block(&mut lines, steer_lines(text, look)),
+                Item::Note(text) => block(&mut lines, note_lines(text, look)),
                 Item::Plan { .. } | Item::Question { .. } => {}
             }
             index += 1;
@@ -820,7 +826,7 @@ mod tests {
         turn.items.push(tool("1", "read_file", "src/a.rs (lines 260-294)", ToolStatus::Done));
         turn.items.push(tool("2", "grep", "TODO", ToolStatus::Running));
         assert!(progress.advance(&turn, look()).is_empty());
-        assert_eq!(texts(&progress.live(&turn, look(), "*", None)), vec!["* Reading 1 file, searching for 1 pattern"]);
+        assert_eq!(texts(&progress.live(&turn, look(), "*", None)), vec!["", "* Reading 1 file, searching for 1 pattern"]);
         if let Item::Tool(grep) = &mut turn.items[1] {
             grep.status = ToolStatus::Done;
         }
@@ -829,7 +835,7 @@ mod tests {
         let wide = Look { width: 100, ..look() };
         assert_eq!(
             texts(&progress.live(&turn, wide, "*", None)),
-            vec!["* Reading 1 file, searching for 1 pattern, running 1 shell command", "* Shell(cargo test)", "  └ Running…"]
+            vec!["", "* Reading 1 file, searching for 1 pattern, running 1 shell command", "* Shell(cargo test)", "  └ Running…"]
         );
         if let Item::Tool(shell) = &mut turn.items[2] {
             shell.status = ToolStatus::Done;
@@ -910,6 +916,18 @@ mod tests {
         let lines = texts(&Progress::new().advance(&turn, look()));
         assert_eq!(lines[1], "● Shell(cargo test) · exit 101");
         assert_eq!(lines[2..4], ["  └ error: one".to_string(), "    error: two".to_string()]);
+    }
+
+    #[test]
+    fn failed_commands_skip_stack_frames() {
+        let mut item = ToolItem::new(legacy("shell"));
+        item.status = ToolStatus::Done;
+        item.output = "Exit code 1\nAssertionError: 26 !== 27\n    at check (a.js:1:1)\n\n    at run (b.js:2:2)\nReferenceError: before is not defined".into();
+        let lines = texts(&tool_body(&item, look()));
+        assert_eq!(lines, ["  └ AssertionError: 26 !== 27", "    ReferenceError: before is not defined"]);
+        item.output = "Exit code 1\nGet-ChildItem : no parameter named 'la'.\nAt line:1 char:93\n+ ... $ProgressPreference='SilentlyContinue'; ls -la\n+                                               ~~~\n    + CategoryInfo          : InvalidArgument\n    + FullyQualifiedErrorId : NamedParameterNotFound".into();
+        let lines = texts(&tool_body(&item, look()));
+        assert_eq!(lines, ["  └ Get-ChildItem : no parameter named 'la'."]);
     }
 
     #[test]

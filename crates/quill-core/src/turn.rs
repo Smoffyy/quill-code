@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::context;
 use crate::policy::{self, Access, Effect, Rule, Verdict};
 use crate::prompt::{PromptContext, system_prompt};
-use crate::protocol::{Approval, Category, Decision, Event, Outcome, PlanStep, Question};
+use crate::protocol::{Approval, Category, Decision, Event, Outcome, PlanStep, Question, StepStatus};
 use crate::session::{Inbox, Input, Session, Sink, TurnContext};
 use crate::tools::{self, Ctx, Host, Output, Prepared, Tool, Toolset};
 
@@ -25,6 +25,22 @@ const CRAMPED: &str = "The context filled up three times in this turn, so Quill 
 const REPEATED: &str = "This is the same call, with the same arguments, that already failed earlier in this turn. Do not send it again: change the arguments or take a different approach.";
 
 const UNCHANGED: &str = "Unchanged: this is the same result as the identical call earlier in this turn, and nothing has changed since. Use that earlier result and go on to the next step instead of calling again.";
+
+const STUCK_AFTER: usize = 3;
+
+const STUCK: &str = "You keep repeating searches and reads you already made. Stop exploring now: make the change with what you know, or give the user your answer.";
+
+const NUDGE_AFTER: usize = 6;
+
+const NUDGE: &str = "You are going in circles: your recent searches and reads returned nothing new. Stop exploring. Using what you already found, do the task now, choosing sensible values yourself where the code does not decide them, then finish with your reply.";
+
+const NUDGED: &str = "Quill asked the model to stop repeating searches and get on with the task.";
+
+const PLAN_LEFT: &str = "Your plan still has steps that are not marked completed:";
+
+const PLAN_NEXT: &str = "If you finished them, call update_plan to mark them completed, then stop without repeating your summary. If any are not done, do them now, or say in one sentence why you are leaving them.";
+
+const REMINDED: &str = "Quill reminded the model that its plan had unfinished steps.";
 
 #[derive(Default)]
 struct Reply {
@@ -88,6 +104,8 @@ pub(crate) fn run(
     session.take_steers();
     session.asked_for_git = tools::asks_for_git(&input.text);
     session.push(Message::user_with_images(input.text, input.images));
+    let start = session.history.len();
+    let mut reminded = false;
     let mut retried = false;
     let mut malformed = 0;
     let mut floor = 0;
@@ -156,9 +174,20 @@ pub(crate) fn run(
                         .into(),
                 );
             }
+            if !reminded && let Some(open) = unfinished(session.history.get(start..).unwrap_or_default()) {
+                reminded = true;
+                session.emit(Event::Note { turn, text: REMINDED.into() });
+                session.push(Message::user(format!("{PLAN_LEFT}\n{open}\n\n{PLAN_NEXT}")));
+                continue;
+            }
             return Outcome::Done;
         }
         run_calls(session, turn, ctx, &tools, &calls, cancel, &mut recall);
+        if recall.repeats >= NUDGE_AFTER && !recall.nudged {
+            recall.nudged = true;
+            session.emit(Event::Note { turn, text: NUDGED.into() });
+            session.push(Message::user(NUDGE));
+        }
     }
     Outcome::Failed(format!("Stopped after {} steps. Send a follow-up to let the agent continue.", ctx.limits.max_steps))
 }
@@ -419,10 +448,22 @@ pub(crate) fn permit(session: &Session, turn: usize, ctx: &TurnContext, request:
     }
 }
 
+fn unfinished(history: &[Message]) -> Option<String> {
+    let steps = history
+        .iter()
+        .rev()
+        .flat_map(|message| message.tool_calls.iter().rev())
+        .find_map(|call| tools::plan_of(&call.function.name, &call.function.arguments))?;
+    let open: Vec<String> = steps.iter().filter(|step| step.status != StepStatus::Done).map(|step| format!("- {}", step.text)).collect();
+    (!open.is_empty()).then(|| open.join("\n"))
+}
+
 #[derive(Default)]
 struct Recall {
     failed: Vec<(String, Value)>,
     seen: Vec<(String, Value, String)>,
+    repeats: usize,
+    nudged: bool,
 }
 
 impl Recall {
@@ -438,7 +479,8 @@ impl Recall {
         }
         if explore {
             if self.seen.iter().any(|(seen, given, text)| *seen == name && *given == args && *text == output.text) {
-                return UNCHANGED.into();
+                self.repeats += 1;
+                return if self.repeats >= STUCK_AFTER { format!("{UNCHANGED}\n\n{STUCK}") } else { UNCHANGED.into() };
             }
             self.seen.push((name, args, output.text.clone()));
         }
@@ -612,6 +654,8 @@ mod tests {
             vec![call("c2", "read_file", read)],
             vec![call("c3", "edit_file", r#"{"path":"a.txt","old_text":"two","new_text":"2"}"#)],
             vec![call("c4", "read_file", read)],
+            vec![call("c5", "read_file", read)],
+            vec![call("c6", "read_file", read)],
             vec![Stream::Content("ok".into())],
         ]);
         let (handle, rx) = start(&root);
@@ -623,6 +667,28 @@ mod tests {
         assert!(last(1).contains("two"));
         assert_eq!(last(2), UNCHANGED);
         assert!(last(4).contains("2"));
+        assert_eq!(last(5), UNCHANGED);
+        assert!(last(6).ends_with(STUCK));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn going_in_circles_gets_a_nudge_from_the_user_side() {
+        let root = temp("circles");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        let mut replies: Vec<Vec<Stream>> = (1..=7).map(|n| vec![call(&format!("c{n}"), "read_file", r#"{"path":"a.txt"}"#)]).collect();
+        replies.push(vec![Stream::Content("ok".into())]);
+        let script = Script::new(replies);
+        let (handle, rx) = start(&root);
+        let input = Input { text: "go".into(), images: Vec::new() };
+        handle.send(Op::Turn { turn: 0, input, context: context(script.clone(), &root, Access::Full), cancel: Arc::default() });
+        let mut notes = 0;
+        assert_eq!(until_finished(&rx, |event| notes += usize::from(matches!(event, Event::Note { .. }))), Outcome::Done);
+        let seen = script.seen.lock().unwrap();
+        assert_eq!(notes, 1);
+        assert_ne!(seen[6].messages.last().unwrap().content, NUDGE);
+        assert_eq!(seen[7].messages.last().unwrap().content, NUDGE);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -652,6 +718,27 @@ mod tests {
     }
 
     #[test]
+    fn an_unfinished_plan_gets_one_reminder() {
+        let root = temp("plan-left");
+        let open =
+            call("c1", "update_plan", r#"{"plan":[{"step":"Write it","status":"completed"},{"step":"Test it","status":"in_progress"}]}"#);
+        let done =
+            call("c2", "update_plan", r#"{"plan":[{"step":"Write it","status":"completed"},{"step":"Test it","status":"completed"}]}"#);
+        let script =
+            Script::new(vec![vec![open], vec![Stream::Content("All done.".into())], vec![done], vec![Stream::Content(String::new())]]);
+        let (handle, rx) = start(&root);
+        let input = Input { text: "go".into(), images: Vec::new() };
+        handle.send(Op::Turn { turn: 0, input, context: context(script.clone(), &root, Access::Full), cancel: Arc::default() });
+        let mut notes = 0;
+        assert_eq!(until_finished(&rx, |event| notes += usize::from(matches!(event, Event::Note { .. }))), Outcome::Done);
+        let seen = script.seen.lock().unwrap();
+        assert_eq!((seen.len(), notes), (4, 1));
+        let reminder = &seen[2].messages.last().unwrap().content;
+        assert!(reminder.starts_with(PLAN_LEFT) && reminder.contains("- Test it") && !reminder.contains("- Write it"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_full_window_is_compacted_and_the_turn_carries_on() {
         let root = temp("compact-turn");
         let usage = Stream::Usage(quill_providers::Tokens { prompt: 8000, completion: 10, cache_read: 0 });
@@ -670,7 +757,8 @@ mod tests {
         assert_eq!(outcome, Outcome::Done);
         assert!(compacted);
         let seen = script.seen.lock().unwrap();
-        assert_eq!(seen.len(), 3);
+        assert_eq!(seen.len(), 4);
+        assert!(seen[3].messages.last().unwrap().content.starts_with(PLAN_LEFT));
         assert!(seen[1].messages[0].content.starts_with("You are compacting a coding session"));
         let resumed = &seen[2].messages;
         assert!(resumed[1].content.contains("They started writing it.") && resumed[1].content.contains("write the parser"));

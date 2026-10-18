@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use quill_core::tools::legacy;
@@ -158,6 +158,8 @@ pub struct Turn {
     pub model: Option<String>,
     #[serde(default)]
     pub usage: Tokens,
+    #[serde(default)]
+    pub gone: Vec<String>,
 }
 
 pub struct FileChanges {
@@ -165,6 +167,7 @@ pub struct FileChanges {
     pub added: usize,
     pub removed: usize,
     pub created: bool,
+    pub deleted: bool,
 }
 
 impl Turn {
@@ -179,6 +182,7 @@ impl Turn {
             images: Vec::new(),
             model: None,
             usage: Tokens::default(),
+            gone: Vec::new(),
         }
     }
 
@@ -205,16 +209,12 @@ impl Turn {
     }
 
     pub fn set_plan(&mut self, steps: Vec<PlanStep>, explanation: Option<String>) {
-        let found = self.items.iter_mut().find_map(|item| match item {
-            Item::Plan { steps, explanation } => Some((steps, explanation)),
-            _ => None,
-        });
-        match found {
-            Some((old_steps, old_explanation)) => {
+        match self.items.last_mut() {
+            Some(Item::Plan { steps: old_steps, explanation: old_explanation }) => {
                 *old_steps = steps;
                 *old_explanation = explanation;
             }
-            None => self.items.push(Item::Plan { steps, explanation }),
+            _ => self.items.push(Item::Plan { steps, explanation }),
         }
     }
 
@@ -271,11 +271,22 @@ impl Turn {
                 added: 0,
                 removed: 0,
                 created: diff.created,
+                deleted: self.gone.contains(&diff.path),
             });
             entry.added += diff.added;
             entry.removed += diff.removed;
         }
-        by_path.into_values().collect()
+        for entry in by_path.values_mut().filter(|entry| entry.created) {
+            entry.added = entry.added.saturating_sub(entry.removed);
+            entry.removed = 0;
+        }
+        by_path.into_values().filter(|entry| !(entry.created && entry.deleted)).collect()
+    }
+
+    pub fn note_gone(&mut self, root: &Path) {
+        self.gone = self.diffs().map(|diff| diff.path.clone()).filter(|path| !root.join(path).exists()).collect();
+        self.gone.sort();
+        self.gone.dedup();
     }
 
     pub fn diffs(&self) -> impl Iterator<Item = &FileDiff> {
@@ -411,18 +422,35 @@ mod tests {
         turn.items.push(tool("2", "edit_file", vec![diff_text("a.py", Some("x\ny\n"), "x\nz\n")]));
         let changes = turn.changes();
         assert_eq!(changes.len(), 1);
-        assert_eq!((changes[0].added, changes[0].removed, changes[0].created), (3, 1, true));
+        assert_eq!((changes[0].added, changes[0].removed, changes[0].created), (2, 0, true));
     }
 
     #[test]
-    fn plans_update_in_place() {
+    fn files_deleted_before_the_turn_ends_leave_the_list() {
+        let root = std::env::temp_dir().join(format!("quill-gone-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("kept.txt"), "x\n").unwrap();
+        let mut turn = Turn::new("p".into(), Vec::new());
+        turn.items.push(tool("1", "write_file", vec![diff_text("scratch.txt", None, "x\n")]));
+        turn.items.push(tool("2", "write_file", vec![diff_text("kept.txt", None, "x\n")]));
+        turn.items.push(tool("3", "edit_file", vec![diff_text("old.txt", Some("x\n"), "y\n")]));
+        turn.note_gone(&root);
+        let changes: Vec<(String, bool)> = turn.changes().into_iter().map(|change| (change.path, change.deleted)).collect();
+        assert_eq!(changes, vec![("kept.txt".to_string(), false), ("old.txt".to_string(), true)]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn plan_updates_follow_the_work() {
         let mut turn = Turn::new("p".into(), Vec::new());
         let step = |status| vec![PlanStep { text: "a".into(), status }];
+        turn.set_plan(step(StepStatus::Pending), None);
         turn.set_plan(step(StepStatus::Active), None);
         turn.push_text("working");
         turn.set_plan(step(StepStatus::Done), Some("finished".into()));
-        assert_eq!(turn.items.len(), 2);
-        assert!(matches!(&turn.items[0], Item::Plan { steps, .. } if steps[0].status == StepStatus::Done));
+        assert_eq!(turn.items.len(), 3);
+        assert!(matches!(&turn.items[0], Item::Plan { steps, .. } if steps[0].status == StepStatus::Active));
+        assert!(matches!(&turn.items[2], Item::Plan { steps, .. } if steps[0].status == StepStatus::Done));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use super::args::{self, COMMAND};
 use super::paths::resolve;
 use super::{Ctx, Output, Prepared, Spec, Tool, Toolset};
 use crate::options::Shell;
-use crate::policy::{Effect, edits_files};
+use crate::policy::{Effect, discards_work, edits_files};
 
 const SCRIPT_EDIT: &str = "Change files with edit_file or write_file, not with shell commands or scripts, so the user sees a diff of every change. Use shell to run programs, builds and tests.";
 use crate::protocol::Category;
@@ -251,10 +251,11 @@ impl Tool for ShellTool {
         let limits = ctx.limits;
         let seconds =
             args::number(args, &["timeout_seconds", "timeout"]).unwrap_or(limits.command_timeout).clamp(1, limits.max_command_timeout);
+        let title = if discards_work(&command) { "Wants to run a command that throws work away" } else { "Wants to run a command" };
         let mut prepared = Prepared::new(
             Effect::Execute,
             command.clone(),
-            "Wants to run a command",
+            title,
             Box::new(move |ctx: &Ctx<'_>| {
                 let (ok, text) =
                     run(ctx.limits.shell, &dir, &command, Duration::from_secs(seconds), ctx.cancel, ctx.limits.max_output, &|chunk| {

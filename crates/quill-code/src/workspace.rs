@@ -438,11 +438,15 @@ impl Workspace {
                 run.asked = Some(Asked::new(tool_id, questions));
             }
             Event::PlanUpdated { steps, explanation, .. } => turn.set_plan(steps, explanation),
+            Event::Note { text, .. } => turn.items.push(Item::Note(text)),
             Event::Usage { tokens, .. } => {
                 thread.context_used = Some(tokens.total());
                 turn.usage.add(tokens);
             }
             Event::TurnFinished { outcome, .. } => {
+                if let Some(root) = thread.worktree.as_ref().or(thread.project.as_ref()) {
+                    turn.note_gone(root);
+                }
                 turn.finish(match outcome {
                     Outcome::Done => TurnState::Done,
                     Outcome::Stopped => TurnState::Stopped,
@@ -467,6 +471,9 @@ impl Workspace {
         run.cancel.store(true, Ordering::Relaxed);
         let Some(thread) = self.threads.iter_mut().find(|t| t.id == run.thread) else { return };
         if let Some(turn) = thread.turns.get_mut(run.turn) {
+            if let Some(root) = thread.worktree.as_ref().or(thread.project.as_ref()) {
+                turn.note_gone(root);
+            }
             turn.finish(TurnState::Stopped);
             if let Some(record) = usage::record(thread.id, thread.provider.as_deref(), turn) {
                 usage::append(&record);
@@ -525,6 +532,7 @@ fn event_turn(event: &Event) -> Option<usize> {
         | Event::ApprovalRequested { turn, .. }
         | Event::QuestionAsked { turn, .. }
         | Event::PlanUpdated { turn, .. }
+        | Event::Note { turn, .. }
         | Event::Usage { turn, .. }
         | Event::TurnFinished { turn, .. } => Some(*turn),
         Event::Message { .. } | Event::Compacting | Event::Compacted { .. } | Event::CompactFailed { .. } => None,

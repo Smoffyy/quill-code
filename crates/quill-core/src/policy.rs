@@ -26,7 +26,7 @@ impl Access {
         match self {
             Access::Supervised => "Checks with you before every change and every command that is not read-only",
             Access::AutoEdits => "Makes edits and read-only commands on its own, checks before the rest",
-            Access::Full => "Works without stopping to ask, except before fetching from the web",
+            Access::Full => "Works without stopping to ask, except before fetching from the web or throwing work away",
         }
     }
 }
@@ -99,6 +99,7 @@ pub fn verdict(access: Access, effect: Effect, tool: &str, subject: &str, rules:
     match effect {
         Effect::Read => Verdict::Allow,
         Effect::Network => Verdict::Ask,
+        Effect::Execute if discards_work(subject) => Verdict::Ask,
         _ if access == Access::Full => Verdict::Allow,
         Effect::Write if access == Access::AutoEdits => Verdict::Allow,
         Effect::Execute if read_only(subject, safe_commands) => Verdict::Allow,
@@ -112,6 +113,25 @@ pub fn read_only(command: &str, safe_commands: &[String]) -> bool {
     }
     let mut parts = command.split(['|', ';', '&', '\n']).map(str::trim).filter(|part| !part.is_empty()).peekable();
     parts.peek().is_some() && parts.all(|part| safe_commands.iter().any(|safe| pattern_matches(safe, part)))
+}
+
+pub fn discards_work(command: &str) -> bool {
+    let text = command.to_lowercase();
+    text.split(['|', ';', '&', '\n']).any(|part| {
+        let words: Vec<&str> = part.split_whitespace().collect();
+        let has = |word: &str| words.contains(&word);
+        let git = |sub: &str| words.first() == Some(&"git") && words.get(1) == Some(&sub);
+        let first = words.first().copied().unwrap_or_default();
+        let recursive = words.iter().any(|word| word.starts_with("-r") || word.starts_with("-fr") || *word == "/s");
+        (git("checkout") && (has("--") || has(".")))
+            || (git("restore") && !has("--staged"))
+            || (git("reset") && has("--hard"))
+            || git("clean")
+            || (git("stash") && (has("drop") || has("clear")))
+            || (git("push") && words.iter().any(|word| word.starts_with("--force") || *word == "-f"))
+            || (git("branch") && has("-d"))
+            || (["rm", "remove-item", "ri", "del", "rd", "rmdir"].contains(&first) && recursive)
+    })
 }
 
 fn redirects_into_a_file(text: &str) -> bool {
@@ -215,6 +235,40 @@ mod tests {
         assert_eq!(verdict(Access::Supervised, Effect::Execute, "shell", "npm test -- --watch", &rules, &[]), Verdict::Allow);
         assert_eq!(verdict(Access::Supervised, Effect::Execute, "shell", "npm testing", &rules, &[]), Verdict::Ask);
         assert!(matches!(verdict(Access::Full, Effect::Execute, "shell", "rm -rf x", &rules, &[]), Verdict::Deny(_)));
+    }
+
+    #[test]
+    fn commands_that_throw_work_away_always_ask() {
+        let discards = [
+            "git checkout -- source/Note.hx",
+            "git checkout .",
+            "git restore src/main.rs",
+            "git reset --hard HEAD~1",
+            "git clean -fd",
+            "git stash drop",
+            "git push --force origin main",
+            "git branch -D old",
+            "rm -rf build",
+            "Remove-Item -Recurse -Force dist",
+            "cargo test; git checkout -- .",
+        ];
+        for command in discards {
+            assert!(discards_work(command), "{command}");
+            assert_eq!(verdict(Access::Full, Effect::Execute, "shell", command, &[], &safe()), Verdict::Ask, "{command}");
+        }
+        let keeps = [
+            "git checkout -b fix-login",
+            "git checkout main",
+            "git restore --staged a.rs",
+            "git push",
+            "rm notes.txt",
+            "Remove-Item a.txt",
+        ];
+        for command in keeps {
+            assert!(!discards_work(command), "{command}");
+        }
+        let rules = vec![Rule::allow("shell", "git clean")];
+        assert_eq!(verdict(Access::Full, Effect::Execute, "shell", "git clean -fd", &rules, &safe()), Verdict::Allow);
     }
 
     #[test]

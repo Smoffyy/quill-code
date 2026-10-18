@@ -589,6 +589,10 @@ fn indent(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
+fn shallowest<'a>(rows: &[&'a str]) -> Option<&'a str> {
+    rows.iter().copied().filter(|line| !line.trim().is_empty()).min_by_key(|line| indent(line))
+}
+
 fn reindent(text: &str, gave: usize, have: &str) -> String {
     let lines: Vec<String> = text
         .lines()
@@ -611,8 +615,8 @@ fn loose_replace(current: &str, old: &str, new: &str) -> Option<String> {
             (0..=lines.len() - wanted.len()).filter(|at| wanted.iter().enumerate().all(|(k, want)| same(lines[at + k], want))).collect();
         if let [at] = hits.as_slice() {
             let sep = if current.contains("\r\n") { "\r\n" } else { "\n" };
-            let new = match wanted.iter().position(|line| !line.trim().is_empty()) {
-                Some(first) if pass == 1 => reindent(&new, indent(wanted[first]), &lines[at + first][..indent(lines[at + first])]),
+            let new = match (shallowest(&wanted), shallowest(&lines[*at..at + wanted.len()])) {
+                (Some(gave), Some(have)) if pass == 1 => reindent(&new, indent(gave), &have[..indent(have)]),
                 _ => new.clone(),
             };
             let mut out: Vec<&str> = lines[..*at].to_vec();
@@ -703,6 +707,11 @@ mod tests {
         let tabs = "fn main() {\n\tlet a = 1;\n\tprintln!(\"{a}\");\n}\n";
         let fixed = replace(tabs, "let a = 1;\nprintln!(\"{a}\");", "let a = 2;\nprintln!(\"{a}\");", false).unwrap();
         assert_eq!(fixed, "fn main() {\n\tlet a = 2;\n\tprintln!(\"{a}\");\n}\n");
+        let doc = "/**\n * Counts words.\n */\nexport function count(text) {\n  return text.split(' ').length;\n}\n";
+        let old = "* Counts words.\n*/\nexport function count(text) {\n  return text.split(' ').length;";
+        let new = "* Counts words.\n*/\nexport function count(text) {\n  return text.split(/\\s+/).length;";
+        let fixed = replace(doc, old, new, false).unwrap();
+        assert!(fixed.contains("\nexport function count(text) {\n  return text.split(/\\s+/).length;\n}"), "{fixed}");
     }
 
     #[test]

@@ -28,11 +28,22 @@ const WORKFLOW: &str = "# How to work
 2. For work with more than two steps, write a short plan with update_plan, keep one step in_progress, and update it as you go.
 3. Explore before changing anything: find the relevant files and read them.
 4. Make focused changes that follow the project's existing style, naming and structure. Do not reformat or rewrite code the task does not touch.
-5. Check your work: build, run or test the code with shell when the project allows it, and fix whatever broke.
+5. Check your work as described under Checking your work, and fix whatever broke.
 6. When a tool call fails, read the error and change your approach. Never repeat a call that failed in exactly the same way.
 7. When the user declines a change or a command, do not try it again in another form. Ask what they would like instead.
 
 Keep going until the task is done. Do not stop between ordinary steps to ask for permission; the app asks the user when it needs to.";
+
+const CHECKING: &str = "# Checking your work
+
+You are responsible for the code working, not only for writing it. After you change code, check it the way the project's own developers would, without being asked:
+
+- Find the project's checks first: the scripts in package.json, a Makefile or justfile, Cargo.toml, pyproject.toml, go.mod, a .csproj or .sln, build.gradle or pom.xml, project.xml or a .hxml file, the CI workflows in .github/workflows, and what the README, AGENTS.md or CONTRIBUTING say. Use the commands they define rather than inventing your own.
+- Run the checks that cover what you changed: the compiler or type checker (such as cargo check, tsc --noEmit, go build or dotnet build), the linter the project already uses (such as cargo clippy, eslint or ruff), and the tests closest to your change, then the whole test suite when the change is broad.
+- When a check fails, read the error, fix the cause and run the check again until it passes. Never weaken or delete a test to make it pass unless the user asks.
+- When you add behaviour and the project has tests, add or update a test for it.
+- Do not install new tools or dependencies only to check your work. When the project has no way to build or test the change, or a check needs something that is missing, say so instead of claiming it works.
+- Before your final reply, make sure the last run of every check you used passed.";
 
 const GIT: &str = "# Git
 
@@ -46,7 +57,7 @@ const ADD_NEWLINE: &str = "Quill ends every file you write or edit with exactly 
 
 const REPLY: &str = "# Your reply
 
-When you finish, reply with a short summary of what you changed and how you checked it. The user sees every tool call and diff, so do not paste file contents back. Use Markdown, with fenced code blocks for code. Be direct and concise.";
+The user sees any text you write between tool calls, so keep it to one short sentence about what you will do next, or write nothing; do your thinking silently, never in the reply. When you finish, reply with a short summary of what you changed and how you checked it. The user sees every tool call and diff, so do not paste file contents back. Use Markdown, with fenced code blocks for code. Be direct and concise.";
 
 pub struct PromptContext<'a> {
     pub model: &'a str,
@@ -93,6 +104,7 @@ pub fn system_prompt(ctx: &PromptContext<'_>) -> String {
             };
             sections.push(format!("{shell}\n\n{COMMAND_RULES}"));
             sections.push(WORKFLOW.to_string());
+            sections.push(CHECKING.to_string());
             if ctx.tools.iter().any(|tool| tool.spec().toolset == Toolset::Git) {
                 sections.push(GIT.to_string());
             }
@@ -146,6 +158,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let text = prompt(Some(&dir), false, "");
         assert!(text.contains("edit_file") && text.contains("read_file") && text.contains("# How to work"));
+        assert!(text.contains("# Checking your work"));
         assert!(text.contains("Windows PowerShell"));
         assert!(text.contains("A file keeps its final newline"));
         assert!(!text.contains("open_pull_request"));

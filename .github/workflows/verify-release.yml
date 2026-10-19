@@ -10,6 +10,21 @@ on:
         required: true
 
 jobs:
+  attestation:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event.release.tag_name || inputs.version }}
+    steps:
+      - run: |
+          tag="v${TAG#v}"
+          gh release verify "$tag" --repo "$GITHUB_REPOSITORY"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir dist
+          gh release verify-asset "$tag" dist/SHA256SUMS --repo "$GITHUB_REPOSITORY"
+
   install:
     strategy:
       fail-fast: false

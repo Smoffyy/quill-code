@@ -290,7 +290,7 @@ You need Rust 1.88 or newer from [rustup](https://rustup.rs) and a C compiler: t
 | `cargo deny check` | Licence and banned-crate policy (`cargo install cargo-deny`) |
 | `vhs docs/demo/demo.tape` | Record the demo above again (needs [VHS](https://github.com/charmbracelet/vhs) and a running model) |
 
-Releases come from `main`: bump `version` in `Cargo.toml`, add its section to `CHANGELOG.md`, and merge `dev` into `main`. CI builds every target into a draft release, which is published by hand once it has been tried. The architecture and conventions are in [AGENTS.md](AGENTS.md).
+Releases come from `main`: bump `version` in `Cargo.toml`, add its section to `CHANGELOG.md`, and merge `dev` into `main`. CI builds every target into a draft release, which is published by hand once it has been tried. Published releases are immutable: their files and tag can never be changed, and `gh release verify-asset v<version> <file>` checks any download against the release's signed attestation. The architecture and conventions are in [AGENTS.md](AGENTS.md).
 
 <br/>
 

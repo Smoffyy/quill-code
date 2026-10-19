@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use quill_agent::{FileDiff, ToolKind};
-use quill_llama::Message;
+use quill_core::tools::legacy;
+use quill_core::{Category, FileDiff, PlanStep, ToolView};
+use quill_providers::{Message, Tokens};
 use serde::{Deserialize, Serialize};
 
 pub fn now_ms() -> u64 {
@@ -27,15 +28,108 @@ pub enum ToolStatus {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(from = "RawTool")]
 pub struct ToolItem {
     pub id: String,
-    pub kind: ToolKind,
+    pub tool: String,
+    pub category: Category,
+    pub active: String,
+    pub done: String,
     pub target: String,
     pub status: ToolStatus,
     pub output: String,
-    pub diff: Option<FileDiff>,
-    #[serde(skip)]
-    pub open: bool,
+    pub diffs: Vec<FileDiff>,
+    pub image: Option<String>,
+    pub started: u64,
+    pub ended: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct RawTool {
+    id: String,
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    category: Option<Category>,
+    #[serde(default)]
+    active: Option<String>,
+    #[serde(default)]
+    done: Option<String>,
+    #[serde(default)]
+    target: String,
+    status: ToolStatus,
+    #[serde(default)]
+    output: String,
+    #[serde(default)]
+    diffs: Vec<FileDiff>,
+    #[serde(default)]
+    diff: Option<FileDiff>,
+    #[serde(default)]
+    image: Option<String>,
+    #[serde(default)]
+    started: u64,
+    #[serde(default)]
+    ended: Option<u64>,
+}
+
+impl From<RawTool> for ToolItem {
+    fn from(raw: RawTool) -> ToolItem {
+        let view = match (raw.tool, raw.category, raw.active, raw.done) {
+            (Some(tool), Some(category), Some(active), Some(done)) => {
+                ToolView { id: raw.id.clone(), tool, category, active, done, target: String::new() }
+            }
+            (tool, ..) => legacy(&tool.or(raw.kind).unwrap_or_default()),
+        };
+        let diffs = if raw.diffs.is_empty() { raw.diff.into_iter().collect() } else { raw.diffs };
+        ToolItem {
+            id: raw.id,
+            tool: view.tool,
+            category: view.category,
+            active: view.active,
+            done: view.done,
+            target: raw.target,
+            status: raw.status,
+            output: raw.output,
+            diffs,
+            image: raw.image,
+            started: raw.started,
+            ended: raw.ended,
+        }
+    }
+}
+
+impl ToolItem {
+    pub fn new(view: ToolView) -> ToolItem {
+        ToolItem {
+            id: view.id,
+            tool: view.tool,
+            category: view.category,
+            active: view.active,
+            done: view.done,
+            target: view.target,
+            status: ToolStatus::Running,
+            output: String::new(),
+            diffs: Vec::new(),
+            image: None,
+            started: now_ms(),
+            ended: None,
+        }
+    }
+
+    pub fn working(&self) -> bool {
+        matches!(self.status, ToolStatus::Running | ToolStatus::Waiting)
+    }
+
+    pub fn seconds(&self) -> Option<f32> {
+        let ended = self.ended?;
+        (self.started > 0 && ended >= self.started).then(|| (ended - self.started) as f32 / 1000.0)
+    }
+
+    pub fn exit_code(&self) -> Option<i32> {
+        self.output.lines().next()?.strip_prefix("Exit code ")?.trim().parse().ok()
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -43,6 +137,10 @@ pub enum Item {
     Reasoning(String),
     Text(String),
     Tool(ToolItem),
+    Plan { steps: Vec<PlanStep>, explanation: Option<String> },
+    Question { id: String, question: String, options: Vec<String>, answer: Option<String> },
+    Steer(String),
+    Note(String),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -58,8 +156,10 @@ pub struct Turn {
     pub images: Vec<PathBuf>,
     #[serde(default)]
     pub model: Option<String>,
-    #[serde(skip)]
-    pub expanded: bool,
+    #[serde(default)]
+    pub usage: Tokens,
+    #[serde(default)]
+    pub gone: Vec<String>,
 }
 
 pub struct FileChanges {
@@ -67,6 +167,7 @@ pub struct FileChanges {
     pub added: usize,
     pub removed: usize,
     pub created: bool,
+    pub deleted: bool,
 }
 
 impl Turn {
@@ -80,7 +181,8 @@ impl Turn {
             attachments,
             images: Vec::new(),
             model: None,
-            expanded: false,
+            usage: Tokens::default(),
+            gone: Vec::new(),
         }
     }
 
@@ -106,11 +208,31 @@ impl Turn {
         }
     }
 
+    pub fn set_plan(&mut self, steps: Vec<PlanStep>, explanation: Option<String>) {
+        match self.items.last_mut() {
+            Some(Item::Plan { steps: old_steps, explanation: old_explanation }) => {
+                *old_steps = steps;
+                *old_explanation = explanation;
+            }
+            _ => self.items.push(Item::Plan { steps, explanation }),
+        }
+    }
+
     pub fn tool_mut(&mut self, id: &str) -> Option<&mut ToolItem> {
         self.items.iter_mut().rev().find_map(|item| match item {
             Item::Tool(tool) if tool.id == id => Some(tool),
             _ => None,
         })
+    }
+
+    pub fn answer(&mut self, id: &str, answers: &[String]) {
+        let asked = self.items.iter_mut().filter_map(|item| match item {
+            Item::Question { id: question, answer, .. } if question == id => Some(answer),
+            _ => None,
+        });
+        for (answer, text) in asked.zip(answers) {
+            *answer = Some(text.clone());
+        }
     }
 
     pub fn finish(&mut self, state: TurnState) {
@@ -120,29 +242,25 @@ impl Turn {
         self.worked_ms = Some(now_ms().saturating_sub(self.started));
         for item in &mut self.items {
             if let Item::Tool(tool) = item
-                && matches!(tool.status, ToolStatus::Running | ToolStatus::Waiting)
+                && tool.working()
             {
                 tool.status = ToolStatus::Failed;
             }
         }
+        if state == TurnState::Done {
+            self.promote_reasoning();
+        }
         self.state = state;
     }
 
-    pub fn final_text(&self) -> Option<usize> {
-        if self.working() {
-            return None;
+    fn promote_reasoning(&mut self) {
+        let last = self.items.iter_mut().rev().find(|item| !matches!(item, Item::Text(t) if t.trim().is_empty()));
+        if let Some(item) = last
+            && let Item::Reasoning(text) = item
+        {
+            let text = std::mem::take(text).trim().to_string();
+            *item = Item::Text(text);
         }
-        let last = self.items.iter().rposition(|item| matches!(item, Item::Text(t) if !t.trim().is_empty()))?;
-        let tools_after = self.items[last..].iter().any(|item| matches!(item, Item::Tool(_)));
-        (!tools_after).then_some(last)
-    }
-
-    pub fn has_steps(&self) -> bool {
-        let final_text = self.final_text();
-        self.items
-            .iter()
-            .enumerate()
-            .any(|(index, item)| Some(index) != final_text && !matches!(item, Item::Text(t) if t.trim().is_empty()))
     }
 
     pub fn changes(&self) -> Vec<FileChanges> {
@@ -153,55 +271,32 @@ impl Turn {
                 added: 0,
                 removed: 0,
                 created: diff.created,
+                deleted: self.gone.contains(&diff.path),
             });
             entry.added += diff.added;
             entry.removed += diff.removed;
         }
-        by_path.into_values().collect()
+        for entry in by_path.values_mut().filter(|entry| entry.created) {
+            entry.added = entry.added.saturating_sub(entry.removed);
+            entry.removed = 0;
+        }
+        by_path.into_values().filter(|entry| !(entry.created && entry.deleted)).collect()
+    }
+
+    pub fn note_gone(&mut self, root: &Path) {
+        self.gone = self.diffs().map(|diff| diff.path.clone()).filter(|path| !root.join(path).exists()).collect();
+        self.gone.sort();
+        self.gone.dedup();
     }
 
     pub fn diffs(&self) -> impl Iterator<Item = &FileDiff> {
-        self.items.iter().filter_map(|item| match item {
-            Item::Tool(ToolItem { diff: Some(diff), status: ToolStatus::Done, .. }) => Some(diff),
-            _ => None,
-        })
-    }
-
-    pub fn summary(&self) -> String {
-        let files = self.changes().len();
-        let mut commands = 0;
-        let mut other = 0;
-        for item in &self.items {
-            if let Item::Tool(tool) = item {
-                match tool.kind {
-                    ToolKind::Run => commands += 1,
-                    ToolKind::Write | ToolKind::Edit => {}
-                    _ => other += 1,
-                }
-            }
-        }
-        let mut parts = Vec::new();
-        if files > 0 {
-            parts.push(format!("changed {files} {}", if files == 1 { "file" } else { "files" }));
-        }
-        if commands > 0 {
-            parts.push(format!("ran {commands} {}", if commands == 1 { "command" } else { "commands" }));
-        }
-        if other > 0 {
-            let noun = if other == 1 { "action" } else { "actions" };
-            parts.push(format!("performed {other} {}{noun}", if parts.is_empty() { "" } else { "other " }));
-        }
-        let sentence = match parts.len() {
-            0 => return "Thought it through".into(),
-            1 => parts.remove(0),
-            2 => parts.join(" and "),
-            _ => {
-                let last = parts.pop().unwrap_or_default();
-                format!("{}, and {last}", parts.join(", "))
-            }
-        };
-        let mut chars = sentence.chars();
-        chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Tool(ToolItem { diffs, status: ToolStatus::Done, .. }) => Some(diffs.iter()),
+                _ => None,
+            })
+            .flatten()
     }
 }
 
@@ -220,6 +315,8 @@ pub struct Thread {
     pub model: Option<String>,
     #[serde(default)]
     pub context_used: Option<u64>,
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 impl Thread {
@@ -236,6 +333,7 @@ impl Thread {
             worktree: None,
             model: None,
             context_used: None,
+            provider: None,
         }
     }
 
@@ -281,10 +379,15 @@ pub fn ago(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quill_agent::diff_text;
+    use quill_core::{StepStatus, diff_text};
 
-    fn tool(id: &str, kind: ToolKind, diff: Option<FileDiff>) -> Item {
-        Item::Tool(ToolItem { id: id.into(), kind, target: "x".into(), status: ToolStatus::Done, output: String::new(), diff, open: false })
+    fn tool(id: &str, name: &str, diffs: Vec<FileDiff>) -> Item {
+        let mut item = ToolItem::new(legacy(name));
+        item.id = id.into();
+        item.target = "x".into();
+        item.status = ToolStatus::Done;
+        item.diffs = diffs;
+        Item::Tool(item)
     }
 
     #[test]
@@ -292,54 +395,85 @@ mod tests {
         let mut turn = Turn::new("p".into(), Vec::new());
         turn.push_text("Hel");
         turn.push_text("lo");
-        turn.items.push(tool("1", ToolKind::Read, None));
+        turn.items.push(tool("1", "read_file", Vec::new()));
         turn.push_text("Done");
         assert_eq!(turn.items.len(), 3);
-        assert!(turn.final_text().is_none());
+        assert!(matches!(&turn.items[0], Item::Text(t) if t == "Hello"));
         turn.finish(TurnState::Done);
-        assert_eq!(turn.final_text(), Some(2));
+        assert!(!turn.working() && turn.worked_ms.is_some());
     }
 
     #[test]
-    fn summary_reads_like_a_sentence() {
+    fn reasoning_that_ends_a_turn_becomes_the_answer() {
         let mut turn = Turn::new("p".into(), Vec::new());
-        turn.items.push(tool("1", ToolKind::Write, Some(diff_text("a.py", None, "x\n"))));
-        turn.items.push(tool("2", ToolKind::Run, None));
-        turn.items.push(tool("3", ToolKind::Read, None));
-        turn.items.push(tool("4", ToolKind::List, None));
-        assert_eq!(turn.summary(), "Changed 1 file, ran 1 command, and performed 2 other actions");
-        let mut reads = Turn::new("p".into(), Vec::new());
-        reads.items.push(tool("1", ToolKind::Read, None));
-        assert_eq!(reads.summary(), "Performed 1 action");
+        turn.push_reasoning("Checking");
+        turn.items.push(tool("1", "shell", Vec::new()));
+        turn.push_reasoning("All updated.");
+        turn.push_text("\n");
+        turn.finish(TurnState::Done);
+        assert!(matches!(&turn.items[0], Item::Reasoning(_)));
+        assert!(matches!(&turn.items[2], Item::Text(t) if t == "All updated."));
     }
 
     #[test]
     fn changes_add_up_per_file() {
         let mut turn = Turn::new("p".into(), Vec::new());
-        turn.items.push(tool("1", ToolKind::Write, Some(diff_text("a.py", None, "x\ny\n"))));
-        turn.items.push(tool("2", ToolKind::Edit, Some(diff_text("a.py", Some("x\ny\n"), "x\nz\n"))));
+        turn.items.push(tool("1", "write_file", vec![diff_text("a.py", None, "x\ny\n")]));
+        turn.items.push(tool("2", "edit_file", vec![diff_text("a.py", Some("x\ny\n"), "x\nz\n")]));
         let changes = turn.changes();
         assert_eq!(changes.len(), 1);
-        assert_eq!((changes[0].added, changes[0].removed, changes[0].created), (3, 1, true));
+        assert_eq!((changes[0].added, changes[0].removed, changes[0].created), (2, 0, true));
+    }
+
+    #[test]
+    fn files_deleted_before_the_turn_ends_leave_the_list() {
+        let root = std::env::temp_dir().join(format!("quill-gone-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("kept.txt"), "x\n").unwrap();
+        let mut turn = Turn::new("p".into(), Vec::new());
+        turn.items.push(tool("1", "write_file", vec![diff_text("scratch.txt", None, "x\n")]));
+        turn.items.push(tool("2", "write_file", vec![diff_text("kept.txt", None, "x\n")]));
+        turn.items.push(tool("3", "edit_file", vec![diff_text("old.txt", Some("x\n"), "y\n")]));
+        turn.note_gone(&root);
+        let changes: Vec<(String, bool)> = turn.changes().into_iter().map(|change| (change.path, change.deleted)).collect();
+        assert_eq!(changes, vec![("kept.txt".to_string(), false), ("old.txt".to_string(), true)]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn plan_updates_follow_the_work() {
+        let mut turn = Turn::new("p".into(), Vec::new());
+        let step = |status| vec![PlanStep { text: "a".into(), status }];
+        turn.set_plan(step(StepStatus::Pending), None);
+        turn.set_plan(step(StepStatus::Active), None);
+        turn.push_text("working");
+        turn.set_plan(step(StepStatus::Done), Some("finished".into()));
+        assert_eq!(turn.items.len(), 3);
+        assert!(matches!(&turn.items[0], Item::Plan { steps, .. } if steps[0].status == StepStatus::Active));
+        assert!(matches!(&turn.items[2], Item::Plan { steps, .. } if steps[0].status == StepStatus::Done));
     }
 
     #[test]
     fn unfinished_turns_stop_on_recovery() {
         let mut thread = Thread::new(None, "hi");
         let mut turn = Turn::new("hi".into(), Vec::new());
-        turn.items.push(Item::Tool(ToolItem {
-            id: "1".into(),
-            kind: ToolKind::Run,
-            target: "x".into(),
-            status: ToolStatus::Running,
-            output: String::new(),
-            diff: None,
-            open: false,
-        }));
+        let mut running = ToolItem::new(legacy("shell"));
+        running.id = "1".into();
+        turn.items.push(Item::Tool(running));
         thread.turns.push(turn);
         thread.recover();
         assert!(thread.turns[0].state == TurnState::Stopped);
         assert!(matches!(&thread.turns[0].items[0], Item::Tool(t) if t.status == ToolStatus::Failed));
+    }
+
+    #[test]
+    fn version_one_threads_still_load() {
+        let old = r#"{"Tool":{"id":"c1","kind":"Run","target":"npm test","status":"Done","output":"ok","diff":null}}"#;
+        let Item::Tool(tool) = serde_json::from_str::<Item>(old).unwrap() else { panic!("a tool item") };
+        assert_eq!((tool.tool.as_str(), tool.category, tool.target.as_str()), ("shell", Category::Command, "npm test"));
+        let saved = serde_json::to_string(&Item::Tool(tool)).unwrap();
+        let Item::Tool(again) = serde_json::from_str::<Item>(&saved).unwrap() else { panic!("a tool item") };
+        assert_eq!(again.tool, "shell");
     }
 
     #[test]
@@ -348,7 +482,7 @@ mod tests {
             Message::user("go"),
             Message::assistant(
                 "",
-                vec![quill_llama::ToolCall::new("a", "read_file", "{}"), quill_llama::ToolCall::new("b", "list_files", "{}")],
+                vec![quill_providers::ToolCall::new("a", "read_file", "{}"), quill_providers::ToolCall::new("b", "list_files", "{}")],
             ),
             Message::tool("a", "ok"),
         ];

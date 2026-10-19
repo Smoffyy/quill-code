@@ -1,0 +1,40 @@
+name: Verify release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to check, for example 1.0.1
+        required: true
+
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.version }}
+    steps:
+      - if: runner.os != 'Windows'
+        run: |
+          version="${TAG#v}"
+          curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/v$version/install.sh" | QUILL_VERSION="$version" sh
+          "$HOME/.local/bin/quill" --version | grep -Fx "quill $version"
+          "$HOME/.local/bin/quill" update | grep -F "is the latest version"
+          "$HOME/.local/bin/quill" versions | grep -E "^$version +.*installed"
+      - if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $version = $env:TAG.TrimStart('v')
+          $env:QUILL_VERSION = $version
+          irm "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v$version/install.ps1" | iex
+          $installed = quill --version
+          if ($installed -ne "quill $version") { throw "Installed $installed, expected quill $version" }
+          $update = quill update
+          if ($update -notmatch "is the latest version") { throw "quill update said: $update" }
+          $listed = quill versions | Where-Object { $_ -match "^$([regex]::Escape($version)) +.*installed" }
+          if (-not $listed) { throw "quill versions does not list $version as installed" }

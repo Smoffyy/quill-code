@@ -37,9 +37,11 @@ pub fn load_threads() -> Vec<Thread> {
 }
 
 pub fn save(thread: &Thread) {
-    let dir = threads_dir();
-    if let Ok(text) = serde_json::to_string(thread) {
-        let _ = fs::create_dir_all(&dir).and_then(|_| fs::write(dir.join(format!("{}.json", thread.id)), text));
+    let path = threads_dir().join(format!("{}.json", thread.id));
+    if let Ok(value) = serde_json::to_value(thread)
+        && let Ok(text) = serde_json::to_string(&quill_config::keep_unknown(&path, value))
+    {
+        let _ = quill_config::write_atomic(&path, &text);
     }
 }
 

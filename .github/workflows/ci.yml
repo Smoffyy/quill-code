@@ -6,8 +6,12 @@ on:
   pull_request:
 
 jobs:
-  windows:
-    runs-on: windows-latest
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -17,6 +21,52 @@ jobs:
       - run: cargo build --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build -p quill-code --locked --target ${{ matrix.target }}
+      - shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/debug/quill"
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          sh scripts/package.sh ${{ matrix.target }} "$binary" dist
+          cat dist/*.sha256 > dist/SHA256SUMS
+      - if: runner.os != 'Windows'
+        run: |
+          QUILL_DOWNLOAD_URL="$PWD/dist" sh install.sh
+          "$HOME/.local/bin/quill" --version
+      - if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $env:QUILL_DOWNLOAD_URL = Join-Path $PWD 'dist'
+          Get-Content -Raw install.ps1 | Invoke-Expression
+          quill --version
+          if ($LASTEXITCODE -ne 0) { throw 'quill did not start from the PATH' }
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses bans sources

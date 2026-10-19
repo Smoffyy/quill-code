@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.version.outputs.release }}
+      notes: ${{ steps.changelog.outputs.notes }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "quill-code") | .version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          state=$(gh release list --limit 1000 --json tagName,isDraft --jq ".[] | select(.tagName == \"v$version\") | if .isDraft then \"draft\" else \"published\" end")
+          if [ "$state" = "published" ]; then
+            echo "v$version is already published. Bump the version in Cargo.toml to make a new release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+      - id: changelog
+        if: steps.version.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if ! awk -v v="[$VERSION]" '$1 == "##" && $2 == v && $3 == "-" && $4 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ { found = 1 } END { exit !found }' CHANGELOG.md; then
+            echo "::error file=CHANGELOG.md::No '## [$VERSION] - YYYY-MM-DD' section in CHANGELOG.md"
+            exit 1
+          fi
+          {
+            echo "notes<<EOF_NOTES"
+            awk -v v="[$VERSION]" '/^\[[^]]+\]: / { exit } $1 == "##" { if (found) exit; found = $2 == v; next } found' CHANGELOG.md
+            echo "EOF_NOTES"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.release == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            cross: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build -p quill-code --release --locked --target ${{ matrix.target }}
+      - shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/quill"
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          if [ "${{ matrix.cross }}" != "true" ]; then "$binary" --version; fi
+          sh scripts/package.sh ${{ matrix.target }} "$binary" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.prepare.outputs.version }}
+          NOTES: ${{ needs.prepare.outputs.notes }}
+        run: |
+          cp install.sh install.ps1 dist/
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          rm *.sha256
+          sha256sum install.sh install.ps1 >> SHA256SUMS
+          {
+            printf '%s\n\n' "$NOTES"
+            printf '## Install\n\n'
+            printf 'macOS and Linux:\n\n```\ncurl -fsSL https://github.com/%s/releases/latest/download/install.sh | sh\n```\n\n' "$GITHUB_REPOSITORY"
+            printf 'Windows (PowerShell):\n\n```\nirm https://github.com/%s/releases/latest/download/install.ps1 | iex\n```\n\n' "$GITHUB_REPOSITORY"
+            printf 'Already installed? Run `quill update`, or `quill update <version>` to switch to another release.\n'
+          } > ../notes.md
+          for id in $(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id"); do
+            echo "Replacing the earlier draft of $TAG"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
+          done
+          gh release create "$TAG" * --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Quill Code $TAG" --notes-file ../notes.md --draft

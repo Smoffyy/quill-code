@@ -1,30 +1,142 @@
-# Quill Code
+<br/>
 
-Quill Code is a coding agent for your terminal that runs only on your own local models. You type `quill` to start it. Run a model in llama.cpp's `llama-server`, LM Studio, Ollama or vLLM, pick the model that powers Quill, and hand it work: it reads and edits your projects, runs commands in your system's own shell, shows every diff, and takes the git side all the way to a pull request.
+<p align="center">
+  <img src="brand/app-icon.svg" alt="" width="112">
+</p>
 
-## Install
+<h1 align="center">Quill Code</h1>
+
+<p align="center">
+  A coding agent for your terminal that runs on your own models. Point it at llama.cpp, LM Studio, Ollama or vLLM, hand it work, and watch every step.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Smoffyy/quill-code/releases/latest"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2FSmoffyy%2Fquill-code%2Freleases%2Flatest&query=%24.name&label=release&labelColor=1f1f1e&color=d97757" alt="Latest release"></a>
+  <a href="https://github.com/Smoffyy/quill-code/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Smoffyy/quill-code/ci.yml?branch=dev&label=CI&labelColor=1f1f1e&logo=githubactions&logoColor=f4f3ee" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-7193f5?labelColor=1f1f1e" alt="MIT license"></a>
+  <a href="https://github.com/Smoffyy/quill-code/commits/dev"><img src="https://img.shields.io/github/last-commit/Smoffyy/quill-code/dev?labelColor=1f1f1e&color=d97757&logo=git&logoColor=f4f3ee" alt="Last commit"></a>
+</p>
+
+<br/>
+
+<p align="center">
+  <img src="docs/images/demo.gif" alt="Quill Code running npm test, editing src/slug.js, running the tests again and finishing with every test passing" width="900">
+</p>
+
+<p align="center"><sub>A real session at real speed: qwen3.5-35b-a3b on llama.cpp, fixing a failing test.</sub></p>
+
+<br/>
+
+## Up and running
 
 macOS and Linux:
 
-```
+```bash
 curl -fsSL https://github.com/Smoffyy/quill-code/releases/latest/download/install.sh | sh
 ```
 
 Windows (PowerShell):
 
-```
+```powershell
 irm https://github.com/Smoffyy/quill-code/releases/latest/download/install.ps1 | iex
 ```
 
-That's all: the script downloads the right build for your system, checks it against the release's checksums, puts `quill` in `~/.local/bin` (or `%LOCALAPPDATA%\Programs\quill` on Windows) and adds that folder to your PATH. No admin rights, no Rust, nothing else to install. Then open a terminal in any project and run `quill`.
+Then open a terminal in any project and run **`quill`**. That is the whole setup.
 
-The first time, Quill Code asks which app runs your models: llama.cpp, LM Studio, Ollama, vLLM, Jan, GPT4All or another OpenAI-compatible server. It looks for the ones already running, asks for an address and an API key if the app needs one, and lists the models it finds. Connect a server later with `/connect`. The first time you run it in a folder, it asks whether you trust the files there; folders inside a trusted one count as trusted.
+The script downloads the right build for your system, checks it against the release's checksums, puts `quill` in `~/.local/bin` (or `%LOCALAPPDATA%\Programs\quill` on Windows) and adds that folder to your PATH. No admin rights, no Rust, nothing else to install. The first time, Quill asks which app runs your models, finds the ones already running and lists their models.
 
-**Update** with `quill update`. It checks GitHub only when you run it, never on its own.
+<br/>
 
-**Switch versions** with `/version`, which lists every published release, installs the one you pick and reopens Quill Code on the thread you were in. From the command line, `quill versions` lists them and `quill update 1.0.0` installs that one. To install a particular release from scratch, pass its version to the one-liner:
+## A quick tour
 
-```
+<table>
+<tr>
+<td width="58%"><img src="docs/images/approval.png" alt="An approval card showing the diff of a rename in src/slug.js, with Allow, Always allow, Allow everything, Deny and tell Quill what to do instead"/></td>
+<td width="42%" valign="middle">
+
+### It asks before it acts
+
+Every edit and command shows up as a card with its full diff before anything happens. Allow it once, always, or for the whole thread, or tell Quill what to do instead. **Shift+Tab** moves between Ask first, Trust edits and Autopilot, and commands that throw work away, like `git reset --hard` or a forced push, ask in every mode.
+
+</td>
+</tr>
+<tr>
+<td width="42%" valign="middle">
+
+### It finds your models
+
+Tool calls, context windows, vision and thinking controls are read from the server, not typed into a config file. `/model` lists everything your servers offer with what is loaded, `/effort` turns thinking on or off or picks a level, and the status line keeps an eye on how full the context is.
+
+</td>
+<td width="58%"><img src="docs/images/models.png" alt="The model picker listing three Qwen models on llama.cpp with their status, context size and vision support"/></td>
+</tr>
+<tr>
+<td width="58%"><img src="docs/images/exec.png" alt="quill exec running the tests headless, fixing src/slug.js and reporting that all tests now pass"/></td>
+<td width="42%" valign="middle">
+
+### It works without you
+
+`quill exec` runs one task headless for scripts and CI: the model's text on standard output, progress on standard error, `--json` for the event stream, and an exit code that says how it went. Or hand it to another agent and let your local model take the mechanical work.
+
+</td>
+</tr>
+</table>
+
+<br/>
+
+## Works with
+
+**Model servers:** llama.cpp · LM Studio · Ollama · vLLM · Jan · GPT4All · any OpenAI-compatible server
+
+**Systems:** Windows (x64) · Linux (x64 and ARM, one static binary for every distribution) · macOS (Apple silicon and Intel)
+
+**Git:** your own `git` for commits, branches and isolated copies, and Git Credential Manager for GitHub, so Quill never stores a token.
+
+<br/>
+
+## Questions people ask
+
+<details>
+<summary><b>Does it come with a model?</b></summary>
+<br/>
+
+No. Quill is the agent, the model runs in an app you choose. The easiest start is [LM Studio](https://lmstudio.ai) or [Ollama](https://ollama.com); [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` gives the most control. Pick a model that supports tool calls. Connect another server any time with `/connect`.
+
+</details>
+
+<details>
+<summary><b>Is anything sent anywhere?</b></summary>
+<br/>
+
+Only what you set up. There is no telemetry, no analytics and no update check running on its own. Quill talks to the model servers you configure, to your git remotes, and to GitHub when you publish a repository, open a pull request, look at a branch's pull request, run `quill update` or open `/version`.
+
+</details>
+
+<details>
+<summary><b>How much may it do on its own?</b></summary>
+<br/>
+
+That is the access mode. **Ask first** runs read-only commands by itself and asks before edits, other commands, commits and pull requests. **Trust edits** also makes edits on its own. **Autopilot** never asks. In every mode, commands that throw work away ask first unless a rule allows them. The first time you run Quill in a folder, it asks whether you trust the files there.
+
+</details>
+
+<details>
+<summary><b>What happens when the context window fills up?</b></summary>
+<br/>
+
+Quill trims old command output first and, if that is not enough, summarises the conversation and carries on where it stopped, keeping your request and its latest steps word for word. The status line says "compacts soon" when it is close, `/compact` does it on demand, and `agent.auto_compact` turns it off.
+
+</details>
+
+<details>
+<summary><b>How do I update or go back to an older version?</b></summary>
+<br/>
+
+`quill update` installs the newest release. `/version` lists every published release, installs the one you pick and reopens Quill on the thread you were in; `quill versions` and `quill update 1.0.0` do the same from the command line. Settings and threads keep what newer versions saved in them, so going back and forward loses nothing.
+
+To install a particular release from scratch, set `QUILL_VERSION` for the one-liner. `QUILL_INSTALL_DIR` picks another folder and `QUILL_NO_MODIFY_PATH=1` leaves your PATH alone.
+
+```bash
 curl -fsSL https://github.com/Smoffyy/quill-code/releases/latest/download/install.sh | QUILL_VERSION=1.0.0 sh
 ```
 
@@ -32,36 +144,33 @@ curl -fsSL https://github.com/Smoffyy/quill-code/releases/latest/download/instal
 $env:QUILL_VERSION = '1.0.0'; irm https://github.com/Smoffyy/quill-code/releases/latest/download/install.ps1 | iex
 ```
 
-Settings and threads keep what newer versions saved in them, so going back and forward again loses nothing.
+</details>
 
-**Uninstall** by deleting `~/.local/bin/quill` (or the `%LOCALAPPDATA%\Programs\quill` folder on Windows). Your settings and threads stay in the settings folder listed by `quill config`.
+<details>
+<summary><b>How do I uninstall it?</b></summary>
+<br/>
 
-The installer reads a few variables: `QUILL_VERSION=1.0.0` installs a particular release, `QUILL_INSTALL_DIR` picks another folder, and `QUILL_NO_MODIFY_PATH=1` leaves your PATH alone. Builds are made for Windows (x64; ARM machines run it through emulation), Linux (x64 and ARM, one static binary for every distribution) and macOS (Apple silicon and Intel).
+Delete `~/.local/bin/quill`, or the `%LOCALAPPDATA%\Programs\quill` folder on Windows. Your settings and threads stay in the settings folder that `quill config` shows.
 
-## Principles
+</details>
 
-- **A full-screen terminal program.** Rust and crossterm. The conversation scrolls inside Quill (mouse wheel, Page Up and Page Down) while the prompt stays fixed at the bottom, and nothing on screen moves on its own. When you quit, the session is printed into your terminal so it stays in the scrollback. To select text while Quill runs, hold Shift as you drag.
-- **No telemetry, ever.** Quill Code talks only to the model servers you configure, to your git remotes, and to GitHub to show the pull request of a branch whose remote is there, and when you publish a repository, open a pull request, run `quill update` or open `/version`.
-- **MIT licensed,** with permissively licensed dependencies only.
-- **Built for local models.** Tool calls, context windows and thinking controls are detected from the server rather than configured by hand.
+<br/>
 
 ## Using it
 
-Run `quill` in a project folder:
-
 ```
-quill                      start in this folder
+quill                          start in this folder
 quill "fix the failing test"   start with a prompt
-quill -c                   continue the latest thread in this folder
-quill -w                   work in an isolated copy (a git worktree) so parallel runs never collide
-quill -C path/to/project   work in another folder
+quill -c                       continue the latest thread in this folder
+quill -w                       work in an isolated copy (a git worktree) so parallel runs never collide
+quill -C path/to/project       work in another folder
 ```
 
-While Quill works, the live area shows what it is doing; press Esc to stop it, or type to steer it. Edits, commands, commits and pull requests ask first unless the access mode allows them.
+While Quill works, the live area shows what it is doing. Type to steer it, press **Esc** to stop it. The conversation scrolls inside Quill with the mouse wheel and Page Up and Page Down, and when you quit, the session is printed into your terminal's scrollback. Hold **Shift** while dragging to select text.
 
-When the conversation nears the end of the model's context window, Quill trims old command output and, if that is not enough, summarises the conversation and carries on with the task where it stopped. Your request is kept word for word, along with its latest steps. The status line says "compacts soon" when it is close; `/compact` does it on demand, and `agent.auto_compact` in the settings turns it off.
-
-Edits keep each file's final newline, or its lack of one, unless you ask Quill to change it. New files follow `insert_final_newline` from the project's `.editorconfig` and otherwise end with a newline. Set `tools.final_newline` to `add` to give every file Quill writes a final newline, or to `remove` to end files right after their last character, except files that need one: patches, diffs, crontabs, and files the `.editorconfig` gives `insert_final_newline = true`.
+<details>
+<summary><b>Keys</b></summary>
+<br/>
 
 | Key | Does |
 | --- | --- |
@@ -79,6 +188,12 @@ Edits keep each file's final newline, or its lack of one, unless you ask Quill t
 | `@path` | Bring a file into the prompt; images go to models that can see them |
 
 Paste or drag a file path into the prompt to attach the file.
+
+</details>
+
+<details>
+<summary><b>Slash commands</b></summary>
+<br/>
 
 | Command | Does |
 | --- | --- |
@@ -101,7 +216,11 @@ Paste or drag a file path into the prompt to attach the file.
 | `/rename <title>` | Rename the thread |
 | `/help`, `/quit` | Help, and leave |
 
-### Scripts and CI
+</details>
+
+<details>
+<summary><b>Scripts and CI</b></summary>
+<br/>
 
 ```
 quill exec "add a test for the parser"
@@ -111,9 +230,13 @@ quill exec --access auto "run the tests and fix what fails"
 quill exec --model local/qwen3.5-9b "explain src/main.rs"
 ```
 
-The model's text goes to standard output and progress to standard error. Nobody is there to approve, so anything the access mode would ask about is declined; `--access auto` allows it. The exit code is 0 when the task finished, 1 when it failed and 130 when it was stopped.
+Nobody is there to approve, so anything the access mode would ask about is declined; `--access auto` allows it. The exit code is 0 when the task finished, 1 when it failed and 130 when it was stopped.
 
-### Models and settings
+</details>
+
+<details>
+<summary><b>Models, settings and profiles</b></summary>
+<br/>
 
 ```
 quill models           model servers, their status and models
@@ -125,63 +248,61 @@ quill config           where the settings live; config edit, config instructions
 
 Settings are kept in `settings.json` in `%APPDATA%\quill-code` on Windows, `~/Library/Application Support/quill-code` on macOS and `~/.config/quill-code` on Linux. A project can override any of them in `.quill/settings.json` at its root.
 
-GitHub sign-in goes through Git Credential Manager, so Quill Code never stores a token.
+Edits keep each file's final newline, or its lack of one. New files follow the project's `.editorconfig`. Set `tools.final_newline` to `add` or `remove` to change that for every file Quill writes, except patches, diffs, crontabs and files the `.editorconfig` asks to keep one.
 
-### Model profiles
-
-Models control their reasoning in different ways. Quill Code knows the common families: gpt-oss takes a `reasoning_effort` of low, medium or high; Qwen3, GLM 4.5 to 4.7 and Hunyuan turn thinking on or off with `enable_thinking`; DeepSeek V3.1 and V3.2 use `thinking`. For anything else it reads what the server reports, such as llama.cpp's chat template or Ollama's capabilities. `/effort` then offers on and off, or the effort levels.
-
-To teach it a new model, or change how a known one is handled, add a profile to `models.profiles` in `settings.json`. The first profile whose `match` appears in the model's name wins, before the built-in ones:
+Models control their reasoning in different ways. gpt-oss takes a `reasoning_effort` of low, medium or high; Qwen3, GLM 4.5 to 4.7 and Hunyuan turn thinking on or off with `enable_thinking`; DeepSeek V3.1 and V3.2 use `thinking`. For anything else Quill reads what the server reports. To teach it a new model, add a profile to `models.profiles`; the first one whose `match` appears in the model's name wins:
 
 ```json
 "profiles": [
   { "match": "my-reasoner", "reasoning": "effort", "levels": ["low", "medium", "high"] },
   { "match": "my-thinker", "except": ["instruct"], "reasoning": "toggle", "kwarg": "enable_thinking" },
-  { "match": "my-coder", "reasoning": "none", "kwargs": { "my_template_variable": true } },
-  { "match": "plain-model", "reasoning": "none" }
+  { "match": "my-coder", "reasoning": "none", "kwargs": { "my_template_variable": true } }
 ]
 ```
 
-`reasoning` is `effort`, `toggle` or `none`. `kwargs` are extra chat template variables sent with every request. A project can add its own profiles in `.quill/settings.json`.
+`reasoning` is `effort`, `toggle` or `none`, and `kwargs` are extra chat template variables sent with every request.
 
-### Good to have
+</details>
 
-- **Git** on the PATH, for commits, branches and isolated copies.
-- **Git Credential Manager** for GitHub sign-in. It comes with [Git for Windows](https://git-scm.com/download/win); on macOS and Linux install [Git Credential Manager](https://github.com/git-ecosystem/git-credential-manager) or any credential helper that stores a GitHub token.
-- On Windows, Windows Terminal is recommended; the classic console works too.
+<br/>
 
-## Building from source
+## Under the hood
 
-For working on Quill Code itself. You need Rust 1.88 or newer from [rustup](https://rustup.rs) and a C compiler for the TLS library:
+For anyone who wants to read or change the code. Rust 2024 and crossterm, no GPU and no browser engine.
 
-- **Windows:** the [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the **Desktop development with C++** workload.
-- **macOS:** the Xcode Command Line Tools, `xcode-select --install`.
-- **Linux:** `sudo apt install build-essential` (Debian, Ubuntu) or `sudo dnf install gcc` (Fedora).
+| Crate | |
+| --- | --- |
+| **quill-code** | The `quill` binary: the screen, slash commands, pickers, approvals, `exec` |
+| **quill-core** | The agent engine: the turn loop, tools, access policy, compaction, the system prompt |
+| **quill-providers** | Model access: OpenAI-compatible chat, LM Studio and Ollama, model profiles, streaming tool calls |
+| **quill-config** | Typed settings in layers, paths per system |
+| **quill-git** | Your `git`: status, commits, branches, worktrees, and the GitHub API |
+| **quill-weave** | The maths of the weave mark on the welcome banner |
 
-Then run it in place with `cargo run -p quill-code --release`, or install your build with `cargo install --path crates/quill-code`.
+You need Rust 1.88 or newer from [rustup](https://rustup.rs) and a C compiler: the [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with **Desktop development with C++** on Windows, `xcode-select --install` on macOS, `build-essential` or `gcc` on Linux.
 
-## Releasing
+| Command | |
+| --- | --- |
+| `cargo run -p quill-code --release` | Build and start `quill` in place |
+| `cargo install --path crates/quill-code` | Install your build |
+| `cargo test --workspace` | Every unit test |
+| `cargo clippy --workspace --all-targets` | Lints, kept clean |
+| `cargo deny check` | Licence and banned-crate policy (`cargo install cargo-deny`) |
+| `vhs docs/demo/demo.tape` | Record the demo above again (needs [VHS](https://github.com/charmbracelet/vhs) and a running model) |
 
-1. Work on `dev` and try your build with `cargo run -p quill-code --release` (or run `target/release/quill` from any project). CI checks every push on Windows, Linux and macOS, including the install scripts.
-2. Bump `version` in `Cargo.toml` and move the `## [Unreleased]` notes in `CHANGELOG.md` into a `## [<version>] - <YYYY-MM-DD>` section, following [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), with a link for it at the bottom. The release is titled `Quill Code v<version>`. Keep the archive names (`quill-<version>-<target>`) and `SHA256SUMS` as they are: `quill update <version>` installs old releases with the newest installer.
-3. Merge `dev` into `main`. The Release workflow builds every target and creates a **draft** release with the archives, checksums and both install scripts. If any build fails, no draft is made.
-4. Download the draft's files from GitHub and try them. Something wrong? Keep working on `dev` and merge again with the same version: the draft is rebuilt and replaced.
-5. When it's right, press **Publish** on the draft. Only then can users get it: the install command and `quill update` only see published releases. Publishing runs the Verify release workflow, which installs the release on Windows, Linux and macOS and checks `quill --version` and `quill update`.
+Releases come from `main`: bump `version` in `Cargo.toml`, add its section to `CHANGELOG.md`, and merge `dev` into `main`. CI builds every target into a draft release, which is published by hand once it has been tried. The architecture and conventions are in [AGENTS.md](AGENTS.md).
 
-A version that is already published is never rebuilt; bump the version for the next release.
+<br/>
 
-To try the packing and installer by hand: `sh scripts/package.sh <target> <binary> dist`, `cat dist/*.sha256 > dist/SHA256SUMS`, then run `install.sh` or `install.ps1` with `QUILL_DOWNLOAD_URL` set to the `dist` folder.
+## Get involved
 
-### Checks
+- **Report a bug** in [Issues](https://github.com/Smoffyy/quill-code/issues), with the output of `quill --version` and the model you used
+- **Send a PR** against `dev`, never `main`, with clippy and the tests passing
 
-```
-cargo test --workspace
-cargo clippy --workspace --all-targets
-cargo deny check
-```
+Quill Code is meant for people who would rather run their own models than rent someone else's. It will stay free and MIT licensed.
 
-`cargo deny` is installed with `cargo install cargo-deny`.
+<br/>
 
-## Licence
-
-MIT, see [LICENSE](LICENSE).
+<p align="center">
+  <a href="CHANGELOG.md">Changelog</a> · <a href="AGENTS.md">Architecture</a> · <a href="LICENSE">MIT License</a>
+</p>

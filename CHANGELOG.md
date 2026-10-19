@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - TBD
+
+### Changed
+
+- Releases are named by their version alone, and their notes end with GitHub's list of what changed and a link to the full comparison with the previous release.
+- `quill versions` lists each release's version and date without repeating its name.
+- Dependencies are updated to their newest versions, including the bundled root certificates.
+
+### Security
+
+- Releases are immutable from 1.0.1 on: once published, their files and tag can never change, and each one carries a signed attestation. Check a download with `gh release verify-asset v1.0.1 <file>`.
+
 ## [1.0.0] - 2026-10-19
 
 ### Added
@@ -61,6 +73,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A commit dialog that can push, open a pull request page or publish a new GitHub repository, and new projects that can start on GitHub with a first branch of your choosing.
 - Slash commands, @ file mentions, image and file attachments with previews, pinned models with Ctrl+1 to 9, a context ring, a PowerShell drawer and saved history.
 - Models, context windows, vision and thinking controls detected from the server.
-
-[unreleased]: https://github.com/Smoffyy/quill-code/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/Smoffyy/quill-code/releases/tag/v1.0.0

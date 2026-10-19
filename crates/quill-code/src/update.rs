@@ -99,7 +99,7 @@ pub fn versions() -> u8 {
     for release in &releases {
         let tags = tags(release, newest.as_deref());
         let tags = if tags.is_empty() { String::new() } else { format!("  ({})", tags.join(", ")) };
-        println!("{:<10} {:<10}  {}{tags}", release.version, release.date, release.title);
+        println!("{:<10} {}{tags}", release.version, release.date);
     }
     println!("\nSwitch to one with: quill update <version>");
     0
@@ -202,7 +202,7 @@ mod tests {
     use super::*;
 
     fn release(version: &str, prerelease: bool) -> Release {
-        Release { version: version.into(), title: String::new(), date: String::new(), prerelease }
+        Release { version: version.into(), date: String::new(), prerelease }
     }
 
     #[test]

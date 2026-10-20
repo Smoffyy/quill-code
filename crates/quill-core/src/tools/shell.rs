@@ -191,6 +191,43 @@ pub fn run(
     (ok, cap(report, max_output))
 }
 
+const SEPARATOR: &str =
+    "Windows PowerShell has no && or ||. Separate commands with ; and use if ($?) { ... } to run one only when the one before it worked.";
+
+const FLAGS: &str = "That is a Unix flag. In PowerShell, ls, rm, cat and mkdir are cmdlets with their own parameters: Get-ChildItem -Force, Remove-Item -Recurse -Force, Get-Content, New-Item -ItemType Directory -Force.";
+
+const INSTEAD: [(&str, &str); 9] = [
+    ("grep", "Select-String -Pattern 'text' -Path file, or the grep tool to search the project"),
+    ("head", "Get-Content file -TotalCount 20"),
+    ("tail", "Get-Content file -Tail 20"),
+    ("touch", "New-Item -ItemType File name"),
+    ("which", "Get-Command name"),
+    ("export", "$env:NAME = 'value'"),
+    ("sed", "edit_file to change files"),
+    ("wc", "(Get-Content file | Measure-Object -Line).Lines"),
+    ("find", "Get-ChildItem -Recurse -Filter name, or the find_files tool"),
+];
+
+fn hint(shell: Shell, output: &str) -> Option<String> {
+    if !matches!(shell, Shell::PowerShell | Shell::Pwsh) {
+        return None;
+    }
+    if output.contains("is not a valid statement separator") {
+        return Some(SEPARATOR.into());
+    }
+    if output.contains("A parameter cannot be found that matches parameter name") {
+        return Some(FLAGS.into());
+    }
+    if !output.contains("is not recognized as the name of a cmdlet") {
+        return None;
+    }
+    let term = output.split("The term '").nth(1)?.split('\'').next()?;
+    Some(match INSTEAD.iter().find(|(name, _)| term.eq_ignore_ascii_case(name)) {
+        Some((name, instead)) => format!("{name} is a Unix command and does not exist in PowerShell. Use {instead}."),
+        None => format!("{term} is not installed or not on the PATH. Check the name, or use a PowerShell cmdlet that does the same."),
+    })
+}
+
 pub struct ShellTool;
 
 const SHELL: Spec = Spec {
@@ -261,6 +298,10 @@ impl Tool for ShellTool {
                     run(ctx.limits.shell, &dir, &command, Duration::from_secs(seconds), ctx.cancel, ctx.limits.max_output, &|chunk| {
                         ctx.host.output(chunk)
                     });
+                let text = match hint(ctx.limits.shell, &text).filter(|_| !ok) {
+                    Some(hint) => format!("{text}\n\n{hint}"),
+                    None => text,
+                };
                 Output { ok, ..Output::ok(text) }
             }),
         );
@@ -322,6 +363,20 @@ mod tests {
         let text = format!("{}{}", "a".repeat(100), "z".repeat(100));
         let capped = cap(text, 60);
         assert!(capped.starts_with("aaaa") && capped.ends_with("zzzz") && capped.contains("[output cut]"));
+    }
+
+    #[test]
+    fn powershell_mistakes_get_a_hint() {
+        let separator = "At line:1 char:8\n+ cd src && node a.js\nThe token '&&' is not a valid statement separator in this version.";
+        assert_eq!(hint(Shell::PowerShell, separator).as_deref(), Some(SEPARATOR));
+        let grep = "grep : The term 'grep' is not recognized as the name of a cmdlet, function, script file, or operable program.";
+        assert!(hint(Shell::PowerShell, grep).unwrap().contains("Select-String"));
+        let missing = "The term 'pnpm' is not recognized as the name of a cmdlet, function, script file, or operable program.";
+        assert!(hint(Shell::Pwsh, missing).unwrap().starts_with("pnpm is not installed"));
+        let flag = "Remove-Item : A parameter cannot be found that matches parameter name 'rf'.";
+        assert_eq!(hint(Shell::PowerShell, flag).as_deref(), Some(FLAGS));
+        assert!(hint(Shell::Bash, separator).is_none());
+        assert!(hint(Shell::PowerShell, "Exit code 1\nnpm ERR! test failed").is_none());
     }
 
     #[test]

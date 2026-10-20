@@ -29,21 +29,21 @@ fn status(value: &str) -> StepStatus {
 }
 
 pub(crate) fn steps(args: &Value) -> Vec<PlanStep> {
-    let list = ["plan", "steps", "items", "todos"].iter().find_map(|key| args.get(*key).and_then(Value::as_array));
-    list.map(|items| {
-        items
-            .iter()
-            .filter_map(|item| match item {
-                Value::String(text) => Some(PlanStep { text: text.trim().to_string(), status: StepStatus::Pending }),
-                _ => {
-                    let text = args::trimmed(item, &["step", "text", "content", "title", "task"])?;
-                    let state = args::text(item, &["status", "state"]).map_or(StepStatus::Pending, status);
-                    Some(PlanStep { text: text.to_string(), status: state })
-                }
-            })
-            .collect()
-    })
-    .unwrap_or_default()
+    args::list(args, &["plan", "steps", "items", "todos"])
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    Value::String(text) => Some(PlanStep { text: text.trim().to_string(), status: StepStatus::Pending }),
+                    _ => {
+                        let text = args::trimmed(item, &["step", "text", "content", "title", "task"])?;
+                        let state = args::text(item, &["status", "state"]).map_or(StepStatus::Pending, status);
+                        Some(PlanStep { text: text.to_string(), status: state })
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl Tool for UpdatePlan {
@@ -109,9 +109,7 @@ const ASK: Spec = Spec {
 
 fn question(value: &Value) -> Option<Question> {
     let question = args::trimmed(value, &["question", "text", "prompt"])?.to_string();
-    let options = ["options", "choices"]
-        .iter()
-        .find_map(|key| value.get(*key).and_then(Value::as_array))
+    let options = args::list(value, &["options", "choices"])
         .map(|items| {
             items
                 .iter()
@@ -125,7 +123,7 @@ fn question(value: &Value) -> Option<Question> {
 }
 
 fn questions(args: &Value) -> Vec<Question> {
-    match args.get("questions").and_then(Value::as_array) {
+    match args::list(args, &["questions"]) {
         Some(items) => items.iter().filter_map(question).collect(),
         None => question(args).into_iter().collect(),
     }

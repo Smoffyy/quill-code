@@ -12,6 +12,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Releases are named by their version alone, and their notes end with GitHub's list of what changed and a link to the full comparison with the previous release.
 - `quill versions` lists each release's version and date without repeating its name.
 - Dependencies are updated to their newest versions, including the bundled root certificates.
+- `read_file` lists what a folder contains when it is given a folder, and calls to `list_dir`, `list_files` or `ls` go to it.
+- Reading a path that does not exist opens the file when exactly one file in the project has that name; otherwise the error names the files with that name, or shows what the nearest folder contains.
+- When `find_files`, or `grep` with a file filter, finds nothing, the reply lists the kinds of files the folder has, so a model that guessed the wrong language corrects itself.
+- When an edit's text is not in the file, the error names the lines that are missing and shows the file's current lines at that spot, ready to copy.
+- A failed PowerShell command that used `&&`, a Unix command such as `grep`, `head` or `touch`, or a Unix flag such as `rm -rf` now ends with the PowerShell way to do it.
+- After renaming, moving or deleting something, Quill searches for the old name to make sure nothing still uses it.
+
+### Fixed
+
+- Glob patterns with a brace group, such as `**/*.{js,ts}`, no longer fail in `find_files` and `grep`.
+- Writes and edits that would replace real code with a placeholder such as `// ... existing code ...` are refused instead of deleting that code.
+- An edit that would leave a file unchanged now says so instead of reporting a change, and rewriting a file with its current content no longer asks for approval.
+- Reading a file with very long lines, such as minified code, no longer floods the model's context.
+- Tool arguments that arrive encoded twice, wrapped in an extra object, followed by stray characters, or with lists sent as text are read correctly.
+- Text a model sends with escaped line breaks (`\n`) instead of real ones is written and matched as intended.
 
 ### Security
 

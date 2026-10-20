@@ -42,6 +42,7 @@ You are responsible for the code working, not only for writing it. After you cha
 - Run the checks that cover what you changed: the compiler or type checker (such as cargo check, tsc --noEmit, go build or dotnet build), the linter the project already uses (such as cargo clippy, eslint or ruff), and the tests closest to your change, then the whole test suite when the change is broad.
 - When a check fails, read the error, fix the cause and run the check again until it passes. Never weaken or delete a test to make it pass unless the user asks.
 - When you add behaviour and the project has tests, add or update a test for it.
+- After you rename, move or delete something, grep for its old name and location to make sure nothing still defines or uses it.
 - Do not install new tools or dependencies only to check your work. When the project has no way to build or test the change, or a check needs something that is missing, say so instead of claiming it works.
 - Before your final reply, make sure the last run of every check you used passed.";
 

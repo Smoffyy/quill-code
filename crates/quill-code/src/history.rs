@@ -310,6 +310,10 @@ fn explored_output(tool: &ToolItem, output: &str) -> String {
     let more = lines.last().and_then(|line| line.strip_prefix("... and ")?.split(' ').next()?.parse::<usize>().ok());
     let found = lines.iter().filter(|line| **line != "--").count() - usize::from(more.is_some()) + more.unwrap_or(0);
     match tool.tool.as_str() {
+        "read_file" if lines.first().is_some_and(|line| line.ends_with(" is empty.")) => "Empty folder".into(),
+        "read_file" if lines.first().is_some_and(|line| line.ends_with(" contains:")) => {
+            format!("Listed {}", plural(found - 1, "item"))
+        }
         "read_file" => format!(
             "Read {}",
             plural(lines.iter().filter(|line| line.trim_start().starts_with(|c: char| c.is_ascii_digit())).count(), "line")
@@ -940,6 +944,8 @@ mod tests {
         assert_eq!(searched("grep", "a.hx:1: sick\n--\na.hx:9: sick\n... and 4 more matches. Narrow it."), "  └ Found 6 lines");
         assert_eq!(searched("find_files", "No files match \"*.hx\". Use grep."), "  └ No files found");
         assert_eq!(searched("find_files", "a.hx\nb.hx"), "  └ Found 2 files");
+        assert_eq!(searched("read_file", "src/ contains:\nlib/\na.js\n... and 3 more."), "  └ Listed 5 items");
+        assert_eq!(searched("read_file", "src/ is empty."), "  └ Empty folder");
     }
 
     #[test]

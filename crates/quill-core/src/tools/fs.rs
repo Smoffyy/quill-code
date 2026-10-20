@@ -1,9 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
 
 use super::args::{self, CONTENT, GLOB, NEW, OLD, PATH, PATTERN};
@@ -80,15 +81,48 @@ fn reading(effect: Effect, path: &Path, action: Action) -> Prepared {
     }
 }
 
+fn patterns(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (at, c) in text.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&text[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts.into_iter().map(str::trim).filter(|part| !part.is_empty()).collect()
+}
+
 fn glob_set(pattern: &str) -> Result<GlobSet, String> {
     let mut builder = GlobSetBuilder::new();
-    for part in pattern.split(',').map(str::trim).filter(|part| !part.is_empty()) {
+    for part in patterns(pattern) {
         let part = part.replace('\\', "/");
         let part = if part.contains(['*', '?', '[', '{']) { part } else { format!("**/*{part}*") };
         let glob = GlobBuilder::new(&part).case_insensitive(true).build().map_err(|e| e.to_string())?;
         builder.add(glob);
     }
     builder.build().map_err(|e| e.to_string())
+}
+
+fn kinds(dir: &Path, limits: &Limits) -> String {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for path in files(dir, limits) {
+        let kind = path.extension().map_or_else(|| "no extension".to_string(), |ext| format!(".{}", ext.to_string_lossy().to_lowercase()));
+        match counts.iter_mut().find(|(seen, _)| *seen == kind) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((kind, 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let shown: Vec<String> = counts.iter().take(8).map(|(kind, count)| format!("{kind} ({count})")).collect();
+    if shown.is_empty() { String::new() } else { format!(" The files there are: {}.", shown.join(", ")) }
 }
 
 fn clip_line(line: &str) -> String {
@@ -156,7 +190,8 @@ impl Tool for FindFiles {
                 }
                 if found.is_empty() {
                     return Output::ok(format!(
-                        "No files match \"{pattern}\". find_files matches file names and paths; to search inside files, use grep."
+                        "No files match \"{pattern}\". find_files matches file names and paths; to search inside files, use grep.{}",
+                        kinds(&dir, ctx.limits)
                     ));
                 }
                 if extra > 0 {
@@ -228,11 +263,13 @@ impl Tool for Grep {
                 let mut out = Vec::new();
                 let mut matches = 0;
                 let mut extra = 0;
+                let mut scanned = 0;
                 for file in candidates {
                     let rel = display(&base, &file);
                     if [&filter, &within].into_iter().flatten().any(|set| !set.is_match(&rel)) {
                         continue;
                     }
+                    scanned += 1;
                     if fs::metadata(&file).map_or(true, |m| m.len() > MAX_FILE) {
                         continue;
                     }
@@ -265,7 +302,8 @@ impl Tool for Grep {
                     }
                 }
                 if out.is_empty() {
-                    return Output::ok(format!("No matches for \"{pattern}\"."));
+                    let hint = if scanned == 0 && !base.is_file() { kinds(&base, ctx.limits) } else { String::new() };
+                    return Output::ok(format!("No matches for \"{pattern}\".{hint}"));
                 }
                 if extra > 0 {
                     out.push(format!("... and {extra} more matches. Narrow the search with a longer pattern, a path or a glob."));
@@ -281,15 +319,15 @@ pub struct ReadFile;
 const READ: Spec = Spec {
     name: "read_file",
     title: "Read files",
-    summary: "Reads a file, or part of one, with line numbers.",
-    aliases: &["read", "view", "cat", "open_file", "view_file", "get_file"],
+    summary: "Reads a file, or part of one, with line numbers, or lists a folder.",
+    aliases: &["read", "view", "cat", "open_file", "view_file", "get_file", "list_dir", "list_directory", "list_files", "ls"],
     toolset: Toolset::Core,
     category: Category::Explore,
     active: "Reading",
     done: "Read",
     parallel: true,
-    description: "Read a text file with line numbers. Read a file before changing it. In a large file, read only the lines you need with start_line and end_line.",
-    guide: "read_file reads a file with line numbers. Read a file before you change it, and in a large file read only the lines you need.",
+    description: "Read a text file with line numbers, or list what a folder contains. Read a file before changing it. In a large file, read only the lines you need with start_line and end_line.",
+    guide: "read_file reads a file with line numbers, or lists a folder (\".\" is the project folder). Read a file before you change it, and in a large file read only the lines you need.",
 };
 
 impl Tool for ReadFile {
@@ -336,12 +374,64 @@ fn span(args: &Value) -> (usize, Option<usize>) {
     (start, end)
 }
 
+fn listing(root: &Path, dir: &Path, limits: &Limits, max: usize) -> String {
+    let ignored = limits.ignored.clone();
+    let entries: Vec<String> = WalkBuilder::new(dir)
+        .max_depth(Some(1))
+        .hidden(false)
+        .require_git(false)
+        .filter_entry(move |entry| {
+            !ignored.iter().any(|name| entry.depth() > 0 && entry.file_name().to_string_lossy().eq_ignore_ascii_case(name))
+        })
+        .sort_by_file_path(|a, b| a.to_string_lossy().to_lowercase().cmp(&b.to_string_lossy().to_lowercase()))
+        .build()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.depth() == 1)
+        .map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type().is_some_and(|t| t.is_dir()) { format!("{name}/") } else { name }
+        })
+        .collect();
+    let name = if dir == root { "The project folder".to_string() } else { format!("{}/", display(root, dir)) };
+    if entries.is_empty() {
+        return format!("{name} is empty.");
+    }
+    let mut out = format!("{name} contains:\n{}", entries.iter().take(max).cloned().collect::<Vec<_>>().join("\n"));
+    if entries.len() > max {
+        out.push_str(&format!("\n... and {} more.", entries.len() - max));
+    }
+    out
+}
+
+fn elsewhere(root: &Path, path: &Path, limits: &Limits) -> Vec<PathBuf> {
+    let Some(name) = path.file_name() else { return Vec::new() };
+    files(root, limits)
+        .into_iter()
+        .filter(|found| found.file_name().is_some_and(|other| other.eq_ignore_ascii_case(name)))
+        .take(6)
+        .collect()
+}
+
+fn missing(root: &Path, path: &Path, found: &[PathBuf], limits: &Limits) -> String {
+    let shown = display(root, path);
+    if !found.is_empty() {
+        let names: Vec<String> = found.iter().map(|path| display(root, path)).collect();
+        return format!("{shown} does not exist. Files with that name: {}.", names.join(", "));
+    }
+    let folder = path.ancestors().skip(1).find(|dir| inside(dir, root) && dir.is_dir()).unwrap_or(root);
+    format!("{shown} does not exist. {}", listing(root, folder, limits, 40))
+}
+
 fn read(root: &Path, path: &Path, start: usize, end: Option<usize>, limits: &Limits) -> Result<String, String> {
     if path.is_dir() {
-        return Err(format!("{} is a folder. Use find_files to see what is in it.", display(root, path)));
+        return Ok(listing(root, path, limits, limits.max_matches));
     }
     if !path.is_file() {
-        return Err(format!("{} does not exist. Use find_files to see what is there.", display(root, path)));
+        return match elsewhere(root, path, limits).as_slice() {
+            [only] => read(root, only, start, end, limits)
+                .map(|text| format!("{} does not exist, so this is {}:\n{text}", display(root, path), display(root, only))),
+            found => Err(missing(root, path, found, limits)),
+        };
     }
     let text = read_text(path)?;
     let lines: Vec<&str> = text.lines().collect();
@@ -351,10 +441,29 @@ fn read(root: &Path, path: &Path, start: usize, end: Option<usize>, limits: &Lim
     if start > lines.len() {
         return Err(format!("The file only has {} lines.", lines.len()));
     }
-    let end = end.unwrap_or(lines.len()).min(lines.len()).min(start + limits.max_read_lines - 1).max(start);
-    let mut out: Vec<String> = (start..=end)
-        .map(|n| if lines[n - 1].trim().is_empty() { format!("{n:>5}") } else { format!("{n:>5}→{}", lines[n - 1]) })
-        .collect();
+    let mut end = end.unwrap_or(lines.len()).min(lines.len()).min(start + limits.max_read_lines - 1).max(start);
+    let mut out = Vec::new();
+    let mut size = 0;
+    for n in start..=end {
+        let line = lines[n - 1];
+        let shown = if line.trim().is_empty() {
+            format!("{n:>5}")
+        } else if line.len() > limits.max_output {
+            let mut cut = limits.max_output;
+            while !line.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!("{n:>5}→{}… [line {n} is {} characters long and was cut here]", &line[..cut], line.chars().count())
+        } else {
+            format!("{n:>5}→{line}")
+        };
+        size += shown.len();
+        if size > limits.max_output && n > start {
+            end = n - 1;
+            break;
+        }
+        out.push(shown);
+    }
     if end < lines.len() || start > 1 {
         out.push(format!("(showing lines {start}-{end} of {}; pass start_line to read more)", lines.len()));
     }
@@ -362,6 +471,20 @@ fn read(root: &Path, path: &Path, start: usize, end: Option<usize>, limits: &Lim
         out.push(NEWLINE_NOTE.into());
     }
     Ok(out.join("\n"))
+}
+
+static PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(PLACEHOLDER_PATTERN).expect("placeholder pattern"));
+
+const PLACEHOLDER_PATTERN: &str = r"(?i)^\s*(?://+|#+|/\*+|<!--|--|;+|\*)\s*(?:(?:\.\.\.|…)\s*(?:[\[(]?\s*(?:rest|existing|remaining|unchanged|other|previous|same|more|omitted|code|keep)\b.*)?|(?:rest|existing|remaining|unchanged|other|previous|omitted)\b.*(?:\.\.\.|…).*)\s*(?:\*/|-->)?\s*$";
+
+fn placeholder<'a>(text: &'a str, before: &str) -> Option<&'a str> {
+    text.lines().map(str::trim).find(|line| PLACEHOLDER.is_match(line) && !before.lines().any(|old| old.trim() == *line))
+}
+
+fn lazy(line: &str, instead: &str) -> String {
+    format!(
+        "The text has the placeholder line \"{line}\" where real code should be. Quill writes exactly what you send, so the code it stands for would be deleted. {instead}"
+    )
 }
 
 struct Change {
@@ -467,11 +590,25 @@ impl Tool for WriteFile {
     fn prepare(&self, args: &Value, ctx: &Ctx<'_>) -> Result<Prepared, String> {
         let (path, before) = target_file(ctx.root, args, "write_file")?;
         let content = args::text(args, &CONTENT).ok_or("write_file needs \"content\": the complete text of the file.")?;
+        let content = if escaped(content) { unescape(content) } else { content.to_string() };
+        let content = content.as_str();
+        if let Some(before) = &before
+            && let Some(line) = placeholder(content, before)
+        {
+            return Err(lazy(
+                line,
+                "write_file replaces the whole file, so send every line of it, or change only part of it with edit_file.",
+            ));
+        }
         let newline = setting(ctx.limits, &path).unwrap_or_else(|| match &before {
             Some(before) => before.ends_with('\n'),
             None => editorconfig::final_newline(&path).unwrap_or(true),
         });
         let after = finished(content.to_string(), Some(newline));
+        if before.as_deref() == Some(after.as_str()) {
+            let text = format!("{} already has exactly this content, so nothing changed.", display(ctx.root, &path));
+            return Ok(Prepared::read(Box::new(move |_: &Ctx<'_>| Output::ok(text))));
+        }
         let diff = diff_text(&display(ctx.root, &path), before.as_deref(), &after);
         let title = if diff.created { "Wants to create a file" } else { "Wants to rewrite a file" };
         Ok(planned(Change { path, after, diff }, title))
@@ -518,14 +655,27 @@ impl Tool for EditFile {
 
     fn prepare(&self, args: &Value, ctx: &Ctx<'_>) -> Result<Prepared, String> {
         let (path, before) = target_file(ctx.root, args, "edit_file")?;
-        let current = before.as_deref().ok_or(format!("{} does not exist. Use write_file to create it.", display(ctx.root, &path)))?;
+        let current = before.as_deref().ok_or_else(|| {
+            format!(
+                "{} To create a new file, use write_file.",
+                missing(ctx.root, &path, &elsewhere(ctx.root, &path, ctx.limits), ctx.limits)
+            )
+        })?;
         let edits = edits(args)?;
         let mut after = current.to_string();
         for (index, (old, new, all)) in edits.iter().enumerate() {
-            after = replace(&after, old, new, *all)
-                .map_err(|error| if edits.len() > 1 { format!("Edit {}: {error}", index + 1) } else { error })?;
+            let checked = match placeholder(new, old) {
+                Some(line) => {
+                    Err(lazy(line, "Send the complete new_text, or make old_text smaller so new_text only needs the lines that change."))
+                }
+                None => replace(&after, old, new, *all),
+            };
+            after = checked.map_err(|error| if edits.len() > 1 { format!("Edit {}: {error}", index + 1) } else { error })?;
         }
         let after = finished(after, setting(ctx.limits, &path));
+        if after == current {
+            return Err("This edit would leave the file exactly as it is: new_text gives the same result as the text already there. Put your change in new_text.".into());
+        }
         let diff = diff_text(&display(ctx.root, &path), before.as_deref(), &after);
         Ok(planned(Change { path, after, diff }, "Wants to change a file"))
     }
@@ -539,7 +689,7 @@ fn edits(args: &Value) -> Result<Vec<(String, String, bool)>, String> {
         )?;
         Ok((old.replace(NEWLINE_NOTE, ""), new.replace(NEWLINE_NOTE, ""), args::flag(value, &["replace_all", "all"])))
     };
-    match args.get("edits").and_then(Value::as_array) {
+    match args::list(args, &["edits"]) {
         Some(list) if !list.is_empty() => list.iter().map(one).collect(),
         _ => Ok(vec![one(args)?]),
     }
@@ -552,13 +702,42 @@ pub fn replace(current: &str, old: &str, new: &str, all: bool) -> Result<String,
     let crlf = current.contains("\r\n") && !old.contains("\r\n");
     let (old, new) = if crlf { (old.replace('\n', "\r\n"), new.replace('\n', "\r\n")) } else { (old.to_string(), new.to_string()) };
     match current.matches(old.as_str()).count() {
-        0 => loose_replace(current, &old, &new).ok_or_else(|| {
-            "old_text was not found in the file. Read the file again and copy the text exactly, including indentation.".into()
-        }),
+        0 if escaped(&old) => replace(current, &unescape(&old), &unescape(&new), all),
+        0 => loose_replace(current, &old, &new).ok_or_else(|| not_found(current, &old)),
         1 => Ok(current.replacen(old.as_str(), &new, 1)),
         _ if all => Ok(current.replace(old.as_str(), &new)),
         n => Err(format!("old_text appears {n} times. Include more surrounding lines so it is unique, or set replace_all.")),
     }
+}
+
+fn escaped(text: &str) -> bool {
+    !text.contains('\n') && text.matches("\\n").count() >= 2
+}
+
+fn unescape(text: &str) -> String {
+    text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"")
+}
+
+fn not_found(current: &str, old: &str) -> String {
+    let old = without_numbers(old.trim_matches(['\r', '\n']));
+    let lines: Vec<&str> = current.lines().collect();
+    let wanted: Vec<&str> = old.lines().filter(|line| !line.trim().is_empty()).collect();
+    let find = |want: &str| lines.iter().position(|line| line.trim() == want.trim());
+    let absent: Vec<&str> = wanted.iter().copied().filter(|want| find(want).is_none()).collect();
+    let mut text = String::from("old_text was not found in the file.");
+    if absent.is_empty() {
+        text.push_str(" Each of its lines is in the file, but not together in that order. Copy one continuous block of lines.");
+    } else {
+        let shown: Vec<String> = absent.iter().take(3).map(|line| format!("  {}", line.trim())).collect();
+        text.push_str(&format!(" These lines of old_text are not in the file at all:\n{}", shown.join("\n")));
+    }
+    if let Some(at) = wanted.iter().find_map(|want| find(want)) {
+        let to = (at + wanted.len().max(3)).min(lines.len()).min(at + 15);
+        let near: Vec<String> = (at..to).map(|n| format!("{:>5}→{}", n + 1, lines[n])).collect();
+        text.push_str(&format!("\nThe file has these lines there now:\n{}", near.join("\n")));
+    }
+    text.push_str("\nCopy old_text from the file's current lines, taking only what comes after the →.");
+    text
 }
 
 fn without_numbers(text: &str) -> String {
@@ -724,6 +903,118 @@ mod tests {
     }
 
     #[test]
+    fn folders_are_listed_and_missing_paths_point_the_way() {
+        let root = temp_root("missing");
+        fs::create_dir_all(root.join("src/lib")).unwrap();
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::write(root.join("src/slug.js"), "export {}\n").unwrap();
+        fs::write(root.join("package.json"), "{}").unwrap();
+        let listed = run(&ReadFile, &root, json!({ "path": "." })).unwrap();
+        assert!(listed.ok);
+        assert_eq!(listed.text, "The project folder contains:\npackage.json\nsrc/");
+        assert_eq!(run(&ReadFile, &root, json!({ "path": "src" })).unwrap().text, "src/ contains:\nlib/\nslug.js");
+        let found = run(&ReadFile, &root, json!({ "path": "slug.js" })).unwrap().text;
+        assert!(found.starts_with("slug.js does not exist, so this is src/slug.js:\n    1→export {}"), "{found}");
+        let failed = |path: &str| {
+            let output = run(&ReadFile, &root, json!({ "path": path })).unwrap();
+            assert!(!output.ok);
+            output.text
+        };
+        assert_eq!(failed("Cargo.toml"), "Cargo.toml does not exist. The project folder contains:\npackage.json\nsrc/");
+        fs::write(root.join("src/lib/slug.js"), "export {}\n").unwrap();
+        assert_eq!(failed("slug.js"), "slug.js does not exist. Files with that name: src/lib/slug.js, src/slug.js.");
+        let edit = run(&EditFile, &root, json!({ "path": "src/lib/missing.js", "old_text": "a", "new_text": "b" })).unwrap_err();
+        assert!(
+            edit.starts_with("src/lib/missing.js does not exist. src/lib/ contains:\nslug.js") && edit.ends_with("use write_file."),
+            "{edit}"
+        );
+        assert_eq!(tools_find("list_dir"), Some("read_file"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn missed_edits_show_what_the_file_has() {
+        let file = "export function formatPrice(cents) {\n  return '$' + (cents / 100).toFixed(2);\n}\n\nexport function parsePrice(text) {\n  return 1;\n}\n";
+        let invented =
+            "import { config } from './config.js';\n\nexport function formatPrice(cents) {\n  return '$' + (cents / 100).toFixed(2);\n}";
+        let error = replace(file, invented, "x", false).unwrap_err();
+        assert!(error.contains("not in the file at all:\n  import { config } from './config.js';"), "{error}");
+        assert!(error.contains("there now:\n    1→export function formatPrice(cents) {\n    2→  return '$'"), "{error}");
+        let shuffled = "  return 1;\nexport function formatPrice(cents) {";
+        assert!(replace(file, shuffled, "x", false).unwrap_err().contains("not together in that order"));
+    }
+
+    #[test]
+    fn double_escaped_text_is_unescaped() {
+        let file = "fn main() {\n    println!(\"hi\");\n}\n";
+        let fixed =
+            replace(file, "fn main() {\\n    println!(\\\"hi\\\");\\n}", "fn main() {\\n    println!(\\\"bye\\\");\\n}", false).unwrap();
+        assert_eq!(fixed, "fn main() {\n    println!(\"bye\");\n}\n");
+        assert_eq!(replace("a = '\\n'\n", "'\\n'", "'\\t'", false).unwrap(), "a = '\\t'\n");
+        let root = temp_root("escaped");
+        run(&WriteFile, &root, json!({ "path": "a.py", "content": "def a():\\n    return 1\\n" })).unwrap();
+        assert_eq!(fs::read_to_string(root.join("a.py")).unwrap(), "def a():\n    return 1\n");
+        run(&WriteFile, &root, json!({ "path": "b.js", "content": "console.log('a\\nb')" })).unwrap();
+        assert_eq!(fs::read_to_string(root.join("b.js")).unwrap(), "console.log('a\\nb')\n");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn placeholders_never_replace_real_code() {
+        for line in [
+            "// ... existing code ...",
+            "    // ...",
+            "# ... rest of the file unchanged",
+            "/* ... */",
+            "<!-- ... -->",
+            "// rest of the methods ...",
+            "// …",
+        ] {
+            assert_eq!(placeholder(&format!("a\n{line}\nb"), "a\nb"), Some(line.trim()), "{line}");
+        }
+        for line in ["// Rest of the setup lives in config.js", "const all = [...items];", "# Usage: run ./build.sh", "// TODO: more"] {
+            assert_eq!(placeholder(line, ""), None, "{line}");
+        }
+        assert_eq!(placeholder("a\n// ...\nb", "a\n// ...\nb"), None);
+        let root = temp_root("lazy");
+        fs::write(root.join("a.js"), "function a() {\n  return 1;\n}\n\nfunction b() {\n  return 2;\n}\n").unwrap();
+        let rewrite = json!({ "path": "a.js", "content": "function a() {\n  return 10;\n}\n\n// ... existing code ...\n" });
+        assert!(run(&WriteFile, &root, rewrite).unwrap_err().contains("send every line"));
+        let edit = json!({ "path": "a.js", "old_text": "function a() {\n  return 1;\n}", "new_text": "function a() {\n  // ...\n}" });
+        assert!(run(&EditFile, &root, edit).unwrap_err().contains("placeholder line \"// ...\""));
+        assert!(run(&WriteFile, &root, json!({ "path": "new.js", "content": "// ...\n" })).unwrap().ok);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn changes_that_change_nothing_say_so() {
+        let root = temp_root("noop");
+        fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        let error = run(&EditFile, &root, json!({ "path": "a.txt", "old_text": "two", "new_text": "two" })).unwrap_err();
+        assert!(error.starts_with("This edit would leave the file exactly as it is"), "{error}");
+        let same = run(&WriteFile, &root, json!({ "path": "a.txt", "content": "one\ntwo\n" })).unwrap();
+        assert!(same.ok && same.diffs.is_empty() && same.text.contains("nothing changed"), "{}", same.text);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn long_lines_do_not_flood_the_context() {
+        let root = temp_root("long");
+        let limits = Limits { max_output: 1000, ..Limits::default() };
+        fs::write(root.join("min.js"), format!("{}\nshort\n", "x".repeat(5000))).unwrap();
+        let text = run_with(&ReadFile, &root, json!({ "path": "min.js" }), &limits).unwrap().text;
+        assert!(text.contains("[line 1 is 5000 characters long and was cut here]") && text.len() < 1200, "{}", text.len());
+        fs::write(root.join("wide.txt"), format!("{0}\n{0}\n{0}\n", "y".repeat(400))).unwrap();
+        let text = run_with(&ReadFile, &root, json!({ "path": "wide.txt" }), &limits).unwrap().text;
+        assert!(text.ends_with("(showing lines 1-2 of 3; pass start_line to read more)"), "{text}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn tools_find(name: &str) -> Option<&'static str> {
+        crate::tools::find(&crate::tools::all(), name).map(|tool| tool.spec().name)
+    }
+
+    #[test]
     fn read_targets_name_the_lines_asked_for() {
         assert_eq!(ReadFile.target(&json!({ "path": "src\\a.rs" })), "src/a.rs");
         assert_eq!(ReadFile.target(&json!({ "path": "a.rs", "start_line": 260, "end_line": 294 })), "a.rs (lines 260-294)");
@@ -756,6 +1047,14 @@ mod tests {
         let named = run(&FindFiles, &root, json!({ "pattern": "*Note*", "path": "source/**" })).unwrap().text;
         assert_eq!(named, "source/Note.hx");
         assert_eq!(run(&FindFiles, &root, json!({ "pattern": "note", "path": "source" })).unwrap().text, "source/Note.hx");
+        let wrong = run(&FindFiles, &root, json!({ "pattern": "*.rs" })).unwrap().text;
+        assert!(wrong.ends_with("The files there are: .hx (1), .txt (1)."), "{wrong}");
+        let filtered = run(&Grep, &root, json!({ "pattern": "sick", "glob": "*.rs" })).unwrap().text;
+        assert_eq!(filtered, "No matches for \"sick\". The files there are: .hx (1), .txt (1).");
+        assert_eq!(run(&Grep, &root, json!({ "pattern": "absent" })).unwrap().text, "No matches for \"absent\".");
+        let braces = run(&FindFiles, &root, json!({ "pattern": "**/*.{hx,txt}" })).unwrap().text;
+        assert_eq!(braces, "notes.txt\nsource/Note.hx");
+        assert_eq!(run(&FindFiles, &root, json!({ "pattern": "*.txt, *.hx" })).unwrap().text, "notes.txt\nsource/Note.hx");
         assert!(run(&Grep, &root, json!({ "pattern": "sick", "path": "src" })).unwrap_err().contains("src does not exist"));
         assert_eq!(Grep.target(&json!({ "pattern": "sick", "path": "source\\" })), "\"sick\" in source/");
         fs::remove_dir_all(&root).unwrap();

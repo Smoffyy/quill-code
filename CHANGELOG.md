@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-10-19
+
+### Changed
+
+- Releases are named by their version alone, and their notes end with GitHub's list of what changed and a link to the full comparison with the previous release.
+- `quill versions` lists each release's version and date without repeating its name.
+- Dependencies are updated to their newest versions, including the bundled root certificates.
+- `read_file` lists what a folder contains when it is given a folder, and calls to `list_dir`, `list_files` or `ls` go to it.
+- Reading a path that does not exist opens the file when exactly one file in the project has that name; otherwise the error names the files with that name, or shows what the nearest folder contains.
+- When `find_files`, or `grep` with a file filter, finds nothing, the reply lists the kinds of files the folder has, so a model that guessed the wrong language corrects itself.
+- When an edit's text is not in the file, the error names the lines that are missing and shows the file's current lines at that spot, ready to copy.
+- A failed PowerShell command that used `&&`, a Unix command such as `grep`, `head` or `touch`, or a Unix flag such as `rm -rf` now ends with the PowerShell way to do it.
+- After renaming, moving or deleting something, Quill searches for the old name to make sure nothing still uses it.
+
+### Fixed
+
+- Glob patterns with a brace group, such as `**/*.{js,ts}`, no longer fail in `find_files` and `grep`.
+- Writes and edits that would replace real code with a placeholder such as `// ... existing code ...` are refused instead of deleting that code.
+- An edit that would leave a file unchanged now says so instead of reporting a change, and rewriting a file with its current content no longer asks for approval.
+- Reading a file with very long lines, such as minified code, no longer floods the model's context.
+- Tool arguments that arrive encoded twice, wrapped in an extra object, followed by stray characters, or with lists sent as text are read correctly.
+- Text a model sends with escaped line breaks (`\n`) instead of real ones is written and matched as intended.
+
+### Security
+
+- Releases are immutable from 1.0.1 on: once published, their files and tag can never change, and each one carries a signed attestation. Check a download with `gh release verify-asset v1.0.1 <file>`.
+
 ## [1.0.0] - 2026-10-19
 
 ### Added
@@ -61,6 +88,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A commit dialog that can push, open a pull request page or publish a new GitHub repository, and new projects that can start on GitHub with a first branch of your choosing.
 - Slash commands, @ file mentions, image and file attachments with previews, pinned models with Ctrl+1 to 9, a context ring, a PowerShell drawer and saved history.
 - Models, context windows, vision and thinking controls detected from the server.
-
-[unreleased]: https://github.com/Smoffyy/quill-code/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/Smoffyy/quill-code/releases/tag/v1.0.0

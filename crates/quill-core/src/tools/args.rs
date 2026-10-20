@@ -12,12 +12,39 @@ pub const BRANCH: [&str; 3] = ["branch", "branch_name", "new_branch"];
 pub const TITLE: [&str; 2] = ["title", "pr_title"];
 pub const BODY: [&str; 3] = ["body", "description", "pr_body"];
 
+const WRAPPERS: [&str; 4] = ["arguments", "args", "parameters", "input"];
+
+fn first_value(text: &str) -> Option<Value> {
+    serde_json::Deserializer::from_str(text).into_iter::<Value>().next()?.ok()
+}
+
 pub fn parse(arguments: &str) -> Value {
     let text = arguments.trim();
     if text.is_empty() {
         return json!({});
     }
-    serde_json::from_str(text).unwrap_or_else(|_| json!({ "__invalid": text }))
+    let mut value = match first_value(text) {
+        Some(value) => value,
+        None => return json!({ "__invalid": text }),
+    };
+    if let Some(inner) = value.as_str().and_then(first_value).filter(Value::is_object) {
+        value = inner;
+    }
+    if let Some(object) = value.as_object()
+        && object.len() == 1
+        && let Some(inner) = WRAPPERS.iter().find_map(|key| object.get(*key)).filter(|inner| inner.is_object())
+    {
+        return inner.clone();
+    }
+    value
+}
+
+pub fn list(args: &Value, keys: &[&str]) -> Option<Vec<Value>> {
+    keys.iter().find_map(|key| match args.get(*key)? {
+        Value::Array(items) => Some(items.clone()),
+        Value::String(text) => first_value(text.trim()).and_then(|value| value.as_array().cloned()),
+        _ => None,
+    })
 }
 
 pub fn invalid(args: &Value) -> Option<&str> {
@@ -52,6 +79,20 @@ mod tests {
         assert_eq!(parse("{\"path\": \"a\"}")["path"], "a");
         assert!(invalid(&parse("{oops")).is_some());
         assert_eq!(parse(""), json!({}));
+    }
+
+    #[test]
+    fn wrapped_and_encoded_arguments_are_unwrapped() {
+        assert_eq!(parse("{\"path\": \"a\"}}")["path"], "a");
+        assert_eq!(parse("{\"path\": \"a\"}</tool_call>")["path"], "a");
+        assert_eq!(parse("\"{\\\"path\\\": \\\"a\\\"}\"")["path"], "a");
+        assert_eq!(parse("{\"arguments\": {\"path\": \"a\"}}")["path"], "a");
+        assert_eq!(parse("{\"input\": \"text\"}")["input"], "text");
+        let args = json!({ "plan": "[{\"step\": \"a\"}]", "edits": [1], "content": "[1, 2]" });
+        assert_eq!(list(&args, &["plan"]).unwrap().len(), 1);
+        assert_eq!(list(&args, &["edits"]).unwrap(), vec![json!(1)]);
+        assert!(list(&args, &["missing"]).is_none());
+        assert_eq!(text(&args, &CONTENT), Some("[1, 2]"));
     }
 
     #[test]

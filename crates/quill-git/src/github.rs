@@ -30,7 +30,6 @@ pub enum PullState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Release {
     pub version: String,
-    pub title: String,
     pub date: String,
     pub prerelease: bool,
 }
@@ -151,7 +150,6 @@ fn parse_release(release: &Value) -> Option<Release> {
     }
     Some(Release {
         version: release["tag_name"].as_str()?.trim_start_matches('v').to_string(),
-        title: release["name"].as_str().unwrap_or_default().to_string(),
         date: release["published_at"].as_str().unwrap_or_default().chars().take(10).collect(),
         prerelease: release["prerelease"] == true,
     })
